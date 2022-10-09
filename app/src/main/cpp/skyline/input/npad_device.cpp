@@ -207,7 +207,8 @@ namespace skyline::input {
         if (!connectionState.connected)
             return;
 
-        WriteNextEntry(*controllerInfo, controllerState);
+        if (controllerInfo)
+            WriteNextEntry(*controllerInfo, controllerState);
         WriteNextEntry(section.defaultController, defaultState);
 
         globalTimestamp++;
