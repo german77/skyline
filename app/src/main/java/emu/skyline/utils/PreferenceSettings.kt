@@ -26,6 +26,7 @@ class PreferenceSettings @Inject constructor(@ApplicationContext private val con
     var isDocked by sharedPreferences(context, true)
     var usernameValue by sharedPreferences(context, context.getString(R.string.username_default))
     var systemLanguage by sharedPreferences(context, 1)
+    var systemRegion by sharedPreferences(context, -1)
 
     // Display
     var forceTripleBuffering by sharedPreferences(context, true)
@@ -37,6 +38,9 @@ class PreferenceSettings @Inject constructor(@ApplicationContext private val con
 
     // GPU
     var gpuDriver by sharedPreferences(context, SYSTEM_GPU_DRIVER)
+
+    // Debug
+    var validationLayer by sharedPreferences(context, false)
 
     // Input
     var onScreenControl by sharedPreferences(context, true)
