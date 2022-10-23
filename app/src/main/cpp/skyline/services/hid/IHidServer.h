@@ -183,6 +183,12 @@ namespace skyline::service::hid {
          */
         Result SendVibrationValues(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
+        /**
+         * @brief Send vibration values to a HID device
+         * @url https://switchbrew.org/wiki/HID_services#SendVibrationValues
+         */
+        Result SetPalmaBoostMode(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
         SERVICE_DECL(
             SFUNC(0x0, IHidServer, CreateAppletResource),
             SFUNC(0x1, IHidServer, ActivateDebugPad),
@@ -212,7 +218,8 @@ namespace skyline::service::hid {
             SFUNC(0xCB, IHidServer, CreateActiveVibrationDeviceList),
             SFUNC(0xC8, IHidServer, GetVibrationDeviceInfo),
             SFUNC(0xC9, IHidServer, SendVibrationValue),
-            SFUNC(0xCE, IHidServer, SendVibrationValues)
+            SFUNC(0xCE, IHidServer, SendVibrationValues),
+            SFUNC(0x20D, IHidServer, SetPalmaBoostMode)
         )
     };
 }
