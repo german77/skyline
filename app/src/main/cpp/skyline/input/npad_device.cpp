@@ -10,7 +10,19 @@ namespace skyline::input {
         : manager(manager),
           section(section),
           id(id),
-          updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {}
+          updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {
+
+        // HW initializes the first 19 entries
+        for (std::size_t i = 0; i < 19; ++i) {
+            WriteNextEntry(section.fullKeyController, defaultState);
+            WriteNextEntry(section.handheldController, defaultState);
+            WriteNextEntry(section.leftController, defaultState);
+            WriteNextEntry(section.rightController, defaultState);
+            WriteNextEntry(section.palmaController, defaultState);
+            WriteNextEntry(section.dualController, defaultState);
+            WriteNextEntry(section.defaultController, defaultState);
+        }
+    }
 
     void NpadDevice::Connect(NpadControllerType newType) {
         if (type == newType) {
