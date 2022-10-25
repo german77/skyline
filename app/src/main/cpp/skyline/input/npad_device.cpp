@@ -11,16 +11,11 @@ namespace skyline::input {
           section(section),
           id(id),
           updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {
+        constexpr std::size_t InitializeEntryCount{19}; //!< HW initializes the first 19 entries
 
-        // HW initializes the first 19 entries
-        for (std::size_t i = 0; i < 19; ++i) {
-            WriteNextEntry(section.fullKeyController, defaultState);
-            WriteNextEntry(section.handheldController, defaultState);
-            WriteNextEntry(section.leftController, defaultState);
-            WriteNextEntry(section.rightController, defaultState);
-            WriteNextEntry(section.palmaController, defaultState);
-            WriteNextEntry(section.dualController, defaultState);
-            WriteNextEntry(section.defaultController, defaultState);
+        ResetDeviceProperties();
+        for (std::size_t i{}; i < InitializeEntryCount; ++i) {
+            WriteEmptyEntries();
         }
     }
 
@@ -41,10 +36,11 @@ namespace skyline::input {
             return;
         }
 
-        section = {};
+        ResetDeviceProperties();
         controllerInfo = nullptr;
 
-        connectionState = {.connected = true};
+        connectionState.raw = 0;
+        connectionState.connected = true;
 
         switch (newType) {
             case NpadControllerType::ProController:
@@ -166,8 +162,7 @@ namespace skyline::input {
         if (type == NpadControllerType::None)
             return;
 
-        section = {};
-        globalTimestamp = 0;
+        ResetDeviceProperties();
 
         index = -1;
         partnerIndex = -1;
@@ -176,6 +171,7 @@ namespace skyline::input {
         controllerInfo = nullptr;
 
         updateEvent->Signal();
+        WriteEmptyEntries();
     }
 
     NpadControllerInfo &NpadDevice::GetControllerInfo() {
@@ -215,12 +211,41 @@ namespace skyline::input {
         nextEntry.status.raw = connectionState.raw;
     }
 
+    void NpadDevice::WriteEmptyEntries() {
+        NpadControllerState emptyEntry{};
+
+        WriteNextEntry(section.fullKeyController, emptyEntry);
+        WriteNextEntry(section.handheldController, emptyEntry);
+        WriteNextEntry(section.leftController, emptyEntry);
+        WriteNextEntry(section.rightController, emptyEntry);
+        WriteNextEntry(section.palmaController, emptyEntry);
+        WriteNextEntry(section.dualController, emptyEntry);
+        WriteNextEntry(section.defaultController, emptyEntry);
+
+        globalTimestamp++;
+    }
+
+    void NpadDevice::ResetDeviceProperties() {
+        // Don't reset assignment mode or ring lifo entries these values are persistent
+        section.header.type = NpadControllerType::None;
+        section.header.singleColor = {};
+        section.header.leftColor = {};
+        section.header.rightColor = {};
+        section.header.singleColorStatus =  NpadColorReadStatus::Disconnected;
+        section.header.dualColorStatus = NpadColorReadStatus::Disconnected;
+        section.deviceType.raw = 0;
+        section.buttonProperties.raw = 0;
+        section.systemProperties.raw = 0;
+        section.singleBatteryLevel = NpadBatteryLevel::Empty;
+        section.leftBatteryLevel = NpadBatteryLevel::Empty;
+        section.rightBatteryLevel = NpadBatteryLevel::Empty;
+    }
+
     void NpadDevice::UpdateSharedMemory() {
         if (!connectionState.connected)
             return;
 
-        if (controllerInfo)
-            WriteNextEntry(*controllerInfo, controllerState);
+        WriteNextEntry(*controllerInfo, controllerState);
         WriteNextEntry(section.defaultController, defaultState);
 
         globalTimestamp++;
