@@ -5,17 +5,24 @@
 
 package emu.skyline.input
 
-import android.view.InputDevice
-import android.view.KeyEvent
-import android.view.MotionEvent
-import android.view.View
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.view.*
+import androidx.core.content.getSystemService
+import emu.skyline.utils.ByteBufferSerializable
 import emu.skyline.utils.PreferenceSettings
+import emu.skyline.utils.u64
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.abs
 
 /**
  * Handles input events during emulation
  */
-class InputHandler(private val inputManager : InputManager, private val preferenceSettings : PreferenceSettings) {
+class InputHandler(private val inputManager : InputManager, private val preferenceSettings : PreferenceSettings) : SensorEventListener {
     companion object {
         /**
          * This initializes a guest controller in libskyline
@@ -55,10 +62,49 @@ class InputHandler(private val inputManager : InputManager, private val preferen
         /**
          * This sets the values of the points on the guest touch-screen
          *
+         * @param index The index of the controller this is directed to
+         * @param motionId The ID of the motion sensor that is being modified
+         * @param value A byte buffer of skyline::input::MotionInput in C++
+         */
+        private external fun setMotionState(index : Int, motionId : Int, value : ByteBuffer)
+
+        /**
+         * This sets the values of the points on the guest touch-screen
+         *
          * @param points An array of skyline::input::TouchScreenPoint in C++ represented as integers
          */
         external fun setTouchState(points : IntArray)
     }
+
+    data class MotionSensorInput(
+        var timestamp : u64 = 0uL,
+        var deltaTimestamp : u64 = 0uL,
+        @param:ByteBufferSerializable.ByteBufferSerializableArray(3) var gyroscope : FloatArray = FloatArray(3),
+        @param:ByteBufferSerializable.ByteBufferSerializableArray(3) var accelerometer : FloatArray = FloatArray(3),
+        @param:ByteBufferSerializable.ByteBufferSerializableArray(4) var quaternion : FloatArray = FloatArray(4),
+        @param:ByteBufferSerializable.ByteBufferSerializableArray(9) var orientationMatrix : FloatArray = FloatArray(9),
+    ) : ByteBufferSerializable
+
+    /**
+     * The latest state of the motion sensor
+     */
+    private val motionSensor = MotionSensorInput()
+
+    /**
+     * Buffer for passing motion data to c++
+     */
+    private val motionDataBufferLeft = ByteBuffer.allocateDirect(0x28).order(ByteOrder.LITTLE_ENDIAN)
+    private val motionDataBufferRight = ByteBuffer.allocateDirect(0x28).order(ByteOrder.LITTLE_ENDIAN)
+    private val motionDataBufferHandheld = ByteBuffer.allocateDirect(0x28).order(ByteOrder.LITTLE_ENDIAN)
+
+    /**
+     * Used for adjusting motion to phone orientation
+     */
+    private val motionRotationMatrix = FloatArray(9)
+    private val motionGyroOrientation : FloatArray = FloatArray(3);
+    private val motionAcelOrientation : FloatArray = FloatArray(3);
+    private var motionAxisOrientationX = SensorManager.AXIS_Y;
+    private var motionAxisOrientationY = SensorManager.AXIS_X;
 
     /**
      * Initializes all of the controllers from [InputManager] on the guest
@@ -83,6 +129,50 @@ class InputHandler(private val inputManager : InputManager, private val preferen
         }
 
         updateControllers()
+    }
+
+    fun initialiseMotionSensors(context : Context) {
+        val sensorManager = context.getSystemService<SensorManager>() ?: return
+        val sensorList = sensorManager.getSensorList(Sensor.TYPE_ALL)
+        val hasRotationVector = sensorList.any { sensor -> sensor.type == Sensor.TYPE_ROTATION_VECTOR }
+
+        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also { accelerometer ->
+            sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME)
+        }
+        sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)?.also { gyroscope ->
+            sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_GAME)
+        }
+        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.also { rotationVector ->
+            sensorManager.registerListener(this, rotationVector, SensorManager.SENSOR_DELAY_GAME)
+        }
+        // Avoid listening to two rotation vectors at once
+        if (!hasRotationVector) {
+            sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)?.also { rotationVector ->
+                sensorManager.registerListener(this, rotationVector, SensorManager.SENSOR_DELAY_GAME)
+            }
+        }
+
+        setMotionOrientation90();
+        val orientationEventListener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation : Int) {
+                when {
+                    isWithinOrientationRange(orientation, 270) -> {
+                        setMotionOrientation270();
+                    }
+                    isWithinOrientationRange(orientation, 90) -> {
+                        setMotionOrientation90();
+                    }
+                }
+            }
+
+            private fun isWithinOrientationRange(
+                currentOrientation : Int, targetOrientation : Int, epsilon : Int = 90
+            ) : Boolean {
+                return currentOrientation > targetOrientation - epsilon
+                        && currentOrientation < targetOrientation + epsilon
+            }
+        }
+        orientationEventListener.enable()
     }
 
     /**
@@ -173,6 +263,82 @@ class InputHandler(private val inputManager : InputManager, private val preferen
         }
 
         return false
+    }
+
+    override fun onAccuracyChanged(sensor : Sensor?, accuracy : Int) {}
+
+    /**
+     * This handles translating any [SensorEvent]s to a [GuestEvent] that is passed into libskyline
+     */
+    override fun onSensorChanged(event : SensorEvent) {
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                motionSensor.accelerometer[0] = motionAcelOrientation[0] * event.values[1] / SensorManager.GRAVITY_EARTH
+                motionSensor.accelerometer[1] = motionAcelOrientation[1] * event.values[0] / SensorManager.GRAVITY_EARTH
+                motionSensor.accelerometer[2] = motionAcelOrientation[2] * event.values[2] / SensorManager.GRAVITY_EARTH
+            }
+
+            Sensor.TYPE_GYROSCOPE -> {
+                // Investigate why sensor value is off by 12x
+                motionSensor.gyroscope[0] = motionGyroOrientation[0] * event.values[1] / 12.0f
+                motionSensor.gyroscope[1] = motionGyroOrientation[1] * event.values[0] / 12.0f
+                motionSensor.gyroscope[2] = motionGyroOrientation[2] * event.values[2] / 12.0f
+            }
+
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                motionSensor.quaternion[0] = event.values[1]
+                motionSensor.quaternion[1] = event.values[0]
+                motionSensor.quaternion[2] = event.values[2]
+                motionSensor.quaternion[3] = event.values[3]
+                SensorManager.getRotationMatrixFromVector(motionRotationMatrix, motionSensor.quaternion)
+                SensorManager.remapCoordinateSystem(motionRotationMatrix, motionAxisOrientationX, motionAxisOrientationY, motionSensor.orientationMatrix);
+            }
+
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> {
+                motionSensor.quaternion[0] = event.values[1]
+                motionSensor.quaternion[1] = event.values[0]
+                motionSensor.quaternion[2] = event.values[2]
+                motionSensor.quaternion[3] = event.values[3]
+                SensorManager.getRotationMatrixFromVector(motionRotationMatrix, motionSensor.quaternion)
+                SensorManager.remapCoordinateSystem(motionRotationMatrix, motionAxisOrientationX, motionAxisOrientationY, motionSensor.orientationMatrix);
+            }
+
+            else -> {}
+        }
+
+        // Only update state on accelerometer data
+        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER)
+            return
+
+        motionSensor.deltaTimestamp = event.timestamp.toULong() - motionSensor.timestamp
+        motionSensor.timestamp = event.timestamp.toULong()
+        setMotionState(0, 0, motionSensor.writeToByteBuffer(ByteBuffer.allocateDirect(0x5C).order(ByteOrder.LITTLE_ENDIAN)))
+        setMotionState(0, 1, motionSensor.writeToByteBuffer(ByteBuffer.allocateDirect(0x5C).order(ByteOrder.LITTLE_ENDIAN)))
+        setMotionState(0, 2, motionSensor.writeToByteBuffer(ByteBuffer.allocateDirect(0x5C).order(ByteOrder.LITTLE_ENDIAN)))
+    }
+
+    fun setMotionOrientation90() {
+        motionGyroOrientation[0] = 1.0f
+        motionGyroOrientation[1] = -1.0f
+        motionGyroOrientation[2] = 1.0f
+        motionAcelOrientation[0] = -1.0f
+        motionAcelOrientation[1] = 1.0f
+        motionAcelOrientation[2] = -1.0f
+        motionAxisOrientationX = SensorManager.AXIS_Y;
+        motionAxisOrientationY = SensorManager.AXIS_X;
+    }
+
+    fun setMotionOrientation270() {
+        motionGyroOrientation[0] = -1.0f
+        motionGyroOrientation[1] = 1.0f
+        motionGyroOrientation[2] = 1.0f
+        motionAcelOrientation[0] = 1.0f
+        motionAcelOrientation[1] = -1.0f
+        motionAcelOrientation[2] = -1.0f
+
+        // This shit is wrong >:(
+        motionAxisOrientationX = SensorManager.AXIS_Y;
+        motionAxisOrientationY = SensorManager.AXIS_X;
     }
 
     fun handleTouchEvent(view : View, event : MotionEvent) : Boolean {
