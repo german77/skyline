@@ -12,7 +12,7 @@
 namespace skyline {
     namespace constant {
         constexpr u16 TlsSlotSize{0x200}; //!< The size of a single TLS slot
-        constexpr u8 TlsSlots{PAGE_SIZE / TlsSlotSize}; //!< The amount of TLS slots in a single page
+        constexpr u8 TlsSlots{constant::PageSize / TlsSlotSize}; //!< The amount of TLS slots in a single page
         constexpr KHandle BaseHandleIndex{0xD000}; //!< The index of the base handle
     }
 
@@ -117,7 +117,7 @@ namespace skyline {
                 std::unique_lock lock(handleMutex);
 
                 std::shared_ptr<objectClass> item;
-                if constexpr (std::is_same<objectClass, KThread>())
+                if constexpr (std::is_same<objectClass, KThread>() || std::is_same<objectClass, KPrivateMemory>())
                     item = std::make_shared<objectClass>(state, constant::BaseHandleIndex + handles.size(), args...);
                 else
                     item = std::make_shared<objectClass>(state, args...);

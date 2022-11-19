@@ -106,18 +106,22 @@ namespace skyline::gpu::interconnect {
         return texture;
     }
 
-    Fermi2D::Fermi2D(GPU &gpu, soc::gm20b::ChannelContext &channelCtx, gpu::interconnect::CommandExecutor &executor) : gpu(gpu), channelCtx(channelCtx), executor(executor) {}
+    Fermi2D::Fermi2D(GPU &gpu, soc::gm20b::ChannelContext &channelCtx)
+        : gpu{gpu},
+          channelCtx{channelCtx},
+          executor{channelCtx.executor} {}
 
     void Fermi2D::Blit(const Surface &srcSurface, const Surface &dstSurface, float srcRectX, float srcRectY, u32 dstRectWidth, u32 dstRectHeight, u32 dstRectX, u32 dstRectY, float duDx, float dvDy, SampleModeOrigin sampleOrigin, bool resolve, SampleModeFilter filter) {
         // TODO: When we support MSAA perform a resolve operation rather than blit when the `resolve` flag is set.
         auto srcGuestTexture{GetGuestTexture(srcSurface)};
         auto dstGuestTexture{GetGuestTexture(dstSurface)};
 
-        auto &textureManager{executor.AcquireTextureManager()};
-        auto srcTextureView{textureManager.FindOrCreate(srcGuestTexture, executor.tag)};
+        auto srcTextureView{gpu.texture.FindOrCreate(srcGuestTexture, executor.tag)};
+        executor.AttachDependency(srcTextureView);
         executor.AttachTexture(srcTextureView.get());
 
-        auto dstTextureView{textureManager.FindOrCreate(dstGuestTexture, executor.tag)};
+        auto dstTextureView{gpu.texture.FindOrCreate(dstGuestTexture, executor.tag)};
+        executor.AttachDependency(dstTextureView);
         executor.AttachTexture(dstTextureView.get());
 
         // Blit shader always samples from centre so adjust if necessary
@@ -144,9 +148,12 @@ namespace skyline::gpu::interconnect {
             srcTextureView.get(), dstTextureView.get(),
             [=](auto &&executionCallback) {
                 auto dst{dstTextureView.get()};
-                executor.AddSubpass(std::move(executionCallback), {{static_cast<i32>(dstRectX), static_cast<i32>(dstRectY)}, {dstRectWidth, dstRectHeight} }, {}, {dst});
+                std::array<TextureView *, 1> sampledImages{srcTextureView.get()};
+                executor.AddSubpass(std::move(executionCallback), {{static_cast<i32>(dstRectX), static_cast<i32>(dstRectY)}, {dstRectWidth, dstRectHeight} }, sampledImages, {}, {dst});
             }
         );
+
+        executor.NotifyPipelineChange();
     }
 
 }

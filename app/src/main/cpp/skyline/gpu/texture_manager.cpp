@@ -6,18 +6,6 @@
 namespace skyline::gpu {
     TextureManager::TextureManager(GPU &gpu) : gpu(gpu) {}
 
-    void TextureManager::lock() {
-        mutex.lock();
-    }
-
-    void TextureManager::unlock() {
-        mutex.unlock();
-    }
-
-    bool TextureManager::try_lock() {
-        return mutex.try_lock();
-    }
-
     std::shared_ptr<TextureView> TextureManager::FindOrCreate(const GuestTexture &guestTexture, ContextTag tag) {
         auto guestMapping{guestTexture.mappings.front()};
 
@@ -36,6 +24,7 @@ namespace skyline::gpu {
          */
 
         std::shared_ptr<Texture> match{};
+        boost::container::small_vector<std::shared_ptr<Texture>, 4> matches{};
         auto mappingEnd{std::upper_bound(textures.begin(), textures.end(), guestMapping)}, hostMapping{mappingEnd};
         while (hostMapping != textures.begin() && (--hostMapping)->end() > guestMapping.begin()) {
             auto &hostMappings{hostMapping->texture->guest->mappings};
@@ -57,9 +46,9 @@ namespace skyline::gpu {
                 // We've gotten a perfect 1:1 match for *all* mappings from the start to end, we just need to check for compatibility aside from this
                 auto &matchGuestTexture{*hostMapping->texture->guest};
                 if (matchGuestTexture.format->IsCompatible(*guestTexture.format) &&
-                     ((matchGuestTexture.dimensions.width == guestTexture.dimensions.width &&
-                       matchGuestTexture.dimensions.height == guestTexture.dimensions.height &&
-                       matchGuestTexture.dimensions.depth == guestTexture.GetViewDepth())
+                    ((((matchGuestTexture.dimensions.width == guestTexture.dimensions.width &&
+                       matchGuestTexture.dimensions.height == guestTexture.dimensions.height) || matchGuestTexture.CalculateLayerSize() == guestTexture.CalculateLayerSize()) &&
+                       matchGuestTexture.GetViewDepth() <= guestTexture.GetViewDepth())
                       || matchGuestTexture.viewMipBase > 0)
                      && matchGuestTexture.tileConfig == guestTexture.tileConfig) {
                     auto &texture{hostMapping->texture};
@@ -68,8 +57,11 @@ namespace skyline::gpu {
                         .aspectMask = guestTexture.aspect,
                         .baseMipLevel = guestTexture.viewMipBase,
                         .levelCount = guestTexture.viewMipCount,
+                        .baseArrayLayer = guestTexture.baseArrayLayer,
                         .layerCount = guestTexture.GetViewLayerCount(),
                     }, guestTexture.format, guestTexture.swizzle);
+                } else {
+                    matches.push_back(hostMapping->texture);
                 }
             } /* else if (mappingMatch) {
                 // We've gotten a partial match with a certain subset of contiguous mappings matching, we need to check if this is a meaningful overlap
@@ -84,6 +76,9 @@ namespace skyline::gpu {
                 }
             } */
         }
+
+        for (auto &texture : matches)
+            texture->SynchronizeGuest(false, true);
 
         // Create a texture as we cannot find one that matches
         auto texture{std::make_shared<Texture>(gpu, guestTexture)};
@@ -102,6 +97,7 @@ namespace skyline::gpu {
             .aspectMask = guestTexture.aspect,
             .baseMipLevel = guestTexture.viewMipBase,
             .levelCount = guestTexture.viewMipCount,
+            .baseArrayLayer = guestTexture.baseArrayLayer,
             .layerCount = guestTexture.GetViewLayerCount(),
         }, guestTexture.format, guestTexture.swizzle);
     }

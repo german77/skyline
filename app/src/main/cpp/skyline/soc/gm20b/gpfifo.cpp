@@ -6,8 +6,7 @@
 #include <kernel/types/KProcess.h>
 #include <soc.h>
 #include <os.h>
-#include "engines/maxwell_3d.h"
-#include "engines/fermi_2d.h"
+#include "channel.h"
 
 namespace skyline::soc::gm20b {
     /**
@@ -62,7 +61,7 @@ namespace skyline::soc::gm20b {
          * @brief Checks if a method is 'pure' i.e. does not touch macro or GPFIFO methods
          */
         bool Pure() const {
-            u16 size{[&]() -> u16  {
+            u32 size{[&]() -> u32  {
                 switch (secOp) {
                     case SecOp::NonIncMethod:
                     case SecOp::ImmdDataMethod:
@@ -74,7 +73,7 @@ namespace skyline::soc::gm20b {
                 }
             }()};
 
-            u16 end{static_cast<u16>(methodAddress + size)};
+            u32 end{static_cast<u32>(methodAddress + size)};
             return end < engine::EngineMethodsEnd && methodAddress >= engine::GPFIFO::RegisterCount;
         }
     };
@@ -95,7 +94,7 @@ namespace skyline::soc::gm20b {
         } else {
             switch (subChannel) {
                 case SubchannelId::ThreeD:
-                    channelCtx.maxwell3D->HandleMacroCall(method - engine::EngineMethodsEnd, argument, lastCall);
+                    channelCtx.maxwell3D.HandleMacroCall(method - engine::EngineMethodsEnd, argument, lastCall);
                     break;
                 case SubchannelId::TwoD:
                     channelCtx.fermi2D.HandleMacroCall(method - engine::EngineMethodsEnd, argument, lastCall);
@@ -108,9 +107,14 @@ namespace skyline::soc::gm20b {
     }
 
     void ChannelGpfifo::SendPure(u32 method, u32 argument, SubchannelId subChannel) {
+        if (subChannel == SubchannelId::ThreeD) [[likely]] {
+            channelCtx.maxwell3D.CallMethod(method, argument);
+            return;
+        }
+
         switch (subChannel) {
             case SubchannelId::ThreeD:
-                channelCtx.maxwell3D->CallMethod(method, argument);
+                channelCtx.maxwell3D.CallMethod(method, argument);
                 break;
             case SubchannelId::Compute:
                 channelCtx.keplerCompute.CallMethod(method, argument);
@@ -132,7 +136,7 @@ namespace skyline::soc::gm20b {
     void ChannelGpfifo::SendPureBatchNonInc(u32 method, span<u32> arguments, SubchannelId subChannel) {
         switch (subChannel) {
             case SubchannelId::ThreeD:
-                channelCtx.maxwell3D->CallMethodBatchNonInc(method, arguments);
+                channelCtx.maxwell3D.CallMethodBatchNonInc(method, arguments);
                 break;
             case SubchannelId::Compute:
                 channelCtx.keplerCompute.CallMethodBatchNonInc(method, arguments);
@@ -165,17 +169,26 @@ namespace skyline::soc::gm20b {
             }
         }
 
-        pushBufferData.resize(gpEntry.size);
-        channelCtx.asCtx->gmmu.Read<u32>(pushBufferData, gpEntry.Address());
+        auto pushBufferMappedRanges{channelCtx.asCtx->gmmu.TranslateRange(gpEntry.Address(), gpEntry.size * sizeof(u32))};
+        auto pushBuffer{[&]() -> span<u32> {
+            if (pushBufferMappedRanges.size() == 1) {
+                return pushBufferMappedRanges.front().cast<u32>();
+            } else {
+                // Create an intermediate copy of pushbuffer data if it's split across multiple mappings
+                pushBufferData.resize(gpEntry.size);
+                channelCtx.asCtx->gmmu.Read<u32>(pushBufferData, gpEntry.Address());
+                return span(pushBufferData);
+            }
+        }()};
 
         // There will be at least one entry here
-        auto entry{pushBufferData.begin()};
+        auto entry{pushBuffer.begin()};
 
         // Executes the current split method, returning once execution is finished or the current GpEntry has reached its end
         auto resumeSplitMethod{[&](){
             switch (resumeState.state) {
                 case MethodResumeState::State::Inc:
-                    while (entry != pushBufferData.end() && resumeState.remaining)
+                    while (entry != pushBuffer.end() && resumeState.remaining)
                         SendFull(resumeState.address++, *(entry++), resumeState.subChannel, --resumeState.remaining == 0);
 
                     break;
@@ -186,7 +199,7 @@ namespace skyline::soc::gm20b {
                     resumeState.state = MethodResumeState::State::NonInc;
                     [[fallthrough]];
                 case MethodResumeState::State::NonInc:
-                    while (entry != pushBufferData.end() && resumeState.remaining)
+                    while (entry != pushBuffer.end() && resumeState.remaining)
                         SendFull(resumeState.address, *(entry++), resumeState.subChannel, --resumeState.remaining == 0);
 
                     break;
@@ -198,18 +211,19 @@ namespace skyline::soc::gm20b {
             resumeSplitMethod();
 
         // Process more methods if the entries are still not all used up after handling resuming
-        for (; entry != pushBufferData.end(); entry++) {
-            if (entry >= pushBufferData.end())
+        for (; entry != pushBuffer.end(); entry++) {
+            if (entry >= pushBuffer.end()) [[unlikely]]
                 throw exception("GPFIFO buffer overflow!"); // This should never happen
 
-            // An entry containing all zeroes is a NOP, skip over it
-            if (*entry == 0)
-                continue;
+            // Entries containing all zeroes is a NOP, skip over them
+            for (; *entry == 0; entry++)
+                if (entry == std::prev(pushBuffer.end()))
+                    return;
 
             PushBufferMethodHeader methodHeader{.raw = *entry};
 
             // Needed in order to check for methods split across multiple GpEntries
-            ssize_t remainingEntries{std::distance(entry, pushBufferData.end()) - 1};
+            ssize_t remainingEntries{std::distance(entry, pushBuffer.end()) - 1};
 
             // Handles storing state and initial execution for methods that are split across multiple GpEntries
             auto startSplitMethod{[&](auto methodState) {
@@ -228,62 +242,47 @@ namespace skyline::soc::gm20b {
 
             /**
              * @brief Handles execution of a specific method type as specified by the State template parameter
-             * @tparam ThreeDOnly Whether to skip subchannel method handling and send all method calls to the 3D engine
              */
-            auto dispatchCalls{[&]<bool ThreeDOnly, MethodResumeState::State State> () {
+            auto dispatchCalls{[&]<MethodResumeState::State State> () {
                 /**
                  * @brief Gets the offset to apply to the method address for a given dispatch loop index
                  */
                 auto methodOffset{[] (u32 i) -> u32 {
-                    switch (State)  {
-                        case MethodResumeState::State::Inc:
-                            return i;
-                        case MethodResumeState::State::OneInc:
-                            return i ? 1 : 0;
-                        case MethodResumeState::State::NonInc:
-                            return 0;
-                    }
+                    if constexpr(State == MethodResumeState::State::Inc)
+                        return i;
+                    else if constexpr (State == MethodResumeState::State::OneInc)
+                        return i ? 1 : 0;
+                    else
+                        return 0;
                 }};
 
                 constexpr u32 BatchCutoff{4}; //!< Cutoff needed to send method calls in a batch which is espcially important for UBO updates. This helps to avoid the extra overhead batching for small packets.
                 // TODO: Only batch for specific target methods like UBO updates, since normal dispatch is generally cheaper
 
-                if (remainingEntries >= methodHeader.methodCount) {
+                if (remainingEntries >= methodHeader.methodCount) { [[likely]]
                     if (methodHeader.Pure()) [[likely]] {
                         if constexpr (State == MethodResumeState::State::NonInc) {
                             // For pure noninc methods we can send all method calls as a span in one go
-                            if (methodHeader.methodCount > BatchCutoff) {
-                                if constexpr (ThreeDOnly)
-                                    channelCtx.maxwell3D->CallMethodBatchNonInc(methodHeader.methodAddress, span<u32>(&(*++entry), methodHeader.methodCount));
-                                else
-                                    SendPureBatchNonInc(methodHeader.methodAddress, span(&(*++entry), methodHeader.methodCount), methodHeader.methodSubChannel);
+                            if (methodHeader.methodCount > BatchCutoff) [[unlikely]] {
+                                SendPureBatchNonInc(methodHeader.methodAddress, span(&(*++entry), methodHeader.methodCount), methodHeader.methodSubChannel);
 
                                 entry += methodHeader.methodCount - 1;
                                 return false;
                             }
                         } else if constexpr (State == MethodResumeState::State::OneInc) {
                             // For pure oneinc methods we can send the initial method then send the rest as a span in one go
-                            if (methodHeader.methodCount > (BatchCutoff + 1)) {
-                                if constexpr (ThreeDOnly) {
-                                    channelCtx.maxwell3D->CallMethod(methodHeader.methodAddress, *++entry);
-                                    channelCtx.maxwell3D->CallMethodBatchNonInc(methodHeader.methodAddress + 1, span(&(*++entry), methodHeader.methodCount - 1));
-                                } else {
-                                    SendPure(methodHeader.methodAddress, *++entry, methodHeader.methodSubChannel);
-                                    SendPureBatchNonInc(methodHeader.methodAddress + 1, span(&(*++entry) ,methodHeader.methodCount - 1), methodHeader.methodSubChannel);
-                                }
+                            if (methodHeader.methodCount > (BatchCutoff + 1)) [[unlikely]] {
+                                SendPure(methodHeader.methodAddress, *++entry, methodHeader.methodSubChannel);
+                                SendPureBatchNonInc(methodHeader.methodAddress + 1, span(&(*++entry) ,methodHeader.methodCount - 1), methodHeader.methodSubChannel);
 
                                 entry += methodHeader.methodCount - 2;
                                 return false;
                             }
                         }
 
-                        for (u32 i{}; i < methodHeader.methodCount; i++) {
-                            if constexpr (ThreeDOnly) {
-                                channelCtx.maxwell3D->CallMethod(methodHeader.methodAddress + methodOffset(i), *++entry);
-                            } else {
-                                SendPure(methodHeader.methodAddress + methodOffset(i), *++entry, methodHeader.methodSubChannel);
-                            }
-                        }
+                        #pragma unroll(2)
+                        for (u32 i{}; i < methodHeader.methodCount; i++)
+                            SendPure(methodHeader.methodAddress + methodOffset(i), *++entry, methodHeader.methodSubChannel);
                     } else {
                         // Slow path for methods that touch GPFIFO or macros
                         for (u32 i{}; i < methodHeader.methodCount; i++)
@@ -299,41 +298,38 @@ namespace skyline::soc::gm20b {
 
             /**
              * @brief Handles execution of a single method
-             * @tparam ThreeDOnly Whether to skip subchannel method handling and send all method calls to the 3D engine
              * @return If the this was the final method in the current GpEntry
              */
-            auto processMethod{[&] <bool ThreeDOnly> () -> bool {
-                switch (methodHeader.secOp) {
-                    case PushBufferMethodHeader::SecOp::IncMethod:
-                        return dispatchCalls.operator()<ThreeDOnly, MethodResumeState::State::Inc>();
-                    case PushBufferMethodHeader::SecOp::NonIncMethod:
-                        return dispatchCalls.operator()<ThreeDOnly, MethodResumeState::State::NonInc>();
-                    case PushBufferMethodHeader::SecOp::OneInc:
-                        return dispatchCalls.operator()<ThreeDOnly, MethodResumeState::State::OneInc>();
-                    case PushBufferMethodHeader::SecOp::ImmdDataMethod:
-                        if (methodHeader.Pure()) {
-                            if constexpr (ThreeDOnly)
-                                channelCtx.maxwell3D->CallMethod(methodHeader.methodAddress, methodHeader.immdData);
-                            else
-                                SendPure(methodHeader.methodAddress, methodHeader.immdData, methodHeader.methodSubChannel);
-                        } else {
-                            SendFull(methodHeader.methodAddress, methodHeader.immdData, methodHeader.methodSubChannel, true);
-                        }
+            auto processMethod{[&] () -> bool {
+                if (methodHeader.secOp == PushBufferMethodHeader::SecOp::IncMethod)  [[likely]] {
+                    return dispatchCalls.operator()<MethodResumeState::State::Inc>();
+                } else if (methodHeader.secOp == PushBufferMethodHeader::SecOp::OneInc) [[likely]] {
+                    return dispatchCalls.operator()<MethodResumeState::State::OneInc>();
+                } else if (methodHeader.secOp == PushBufferMethodHeader::SecOp::ImmdDataMethod) {
+                    if (methodHeader.Pure())
+                        SendPure(methodHeader.methodAddress, methodHeader.immdData, methodHeader.methodSubChannel);
+                    else
+                        SendFull(methodHeader.methodAddress, methodHeader.immdData, methodHeader.methodSubChannel, true);
+
+                    return false;
+                } else if (methodHeader.secOp == PushBufferMethodHeader::SecOp::NonIncMethod) [[unlikely]] {
+                    return dispatchCalls.operator()<MethodResumeState::State::NonInc>();
+                } else if (methodHeader.secOp == PushBufferMethodHeader::SecOp::EndPbSegment) [[unlikely]] {
+                    return true;
+                } else if (methodHeader.secOp == PushBufferMethodHeader::SecOp::Grp0UseTert) {
+                    if (methodHeader.tertOp == PushBufferMethodHeader::TertOp::Grp0SetSubDevMask)
                         return false;
-                    case PushBufferMethodHeader::SecOp::EndPbSegment:
-                        return true;
-                    default:
-                        throw exception("Unsupported pushbuffer method SecOp: {}", static_cast<u8>(methodHeader.secOp));
+
+                    throw exception("Unsupported pushbuffer method TertOp: {}", static_cast<u8>(methodHeader.tertOp));
+                } else {
+                    throw exception("Unsupported pushbuffer method SecOp: {}", static_cast<u8>(methodHeader.secOp));
                 }
             }};
 
             bool hitEnd{[&]() {
-                if (methodHeader.methodSubChannel == SubchannelId::ThreeD) { [[likely]]
-                    return processMethod.operator()<true>();
-                } else {
-                    channelCtx.maxwell3D->FlushEngineState(); // Flush the 3D engine state when doing any calls to other engines
-                    return processMethod.operator()<false>();
-                }
+                if (methodHeader.methodSubChannel != SubchannelId::ThreeD) [[unlikely]]
+                    channelCtx.maxwell3D.FlushEngineState(); // Flush the 3D engine state when doing any calls to other engines
+                return processMethod();
             }()};
 
             if (hitEnd)
@@ -349,13 +345,23 @@ namespace skyline::soc::gm20b {
             signal::SetSignalHandler({SIGINT, SIGILL, SIGTRAP, SIGBUS, SIGFPE}, signal::ExceptionalSignalHandler);
             signal::SetSignalHandler({SIGSEGV}, nce::NCE::HostSignalHandler); // We may access NCE trapped memory
 
-            gpEntries.Process([this](GpEntry gpEntry) {
+            bool channelLocked{};
+
+            gpEntries.Process([this, &channelLocked](GpEntry gpEntry) {
                 Logger::Debug("Processing pushbuffer: 0x{:X}, Size: 0x{:X}", gpEntry.Address(), +gpEntry.size);
+
+                if (!channelLocked) {
+                    channelCtx.Lock();
+                    channelLocked = true;
+                }
+
                 Process(gpEntry);
-            }, [this]() {
+            }, [this, &channelLocked]() {
                 // If we run out of GpEntries to process ensure we submit any remaining GPU work before waiting for more to arrive
                 Logger::Debug("Finished processing pushbuffer batch");
                 channelCtx.executor.Submit();
+                channelCtx.Unlock();
+                channelLocked = false;
             });
         } catch (const signal::SignalException &e) {
             if (e.signal != SIGINT) {

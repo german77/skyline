@@ -24,7 +24,8 @@ namespace skyline::gpu {
     PresentationEngine::PresentationEngine(const DeviceState &state, GPU &gpu)
         : state{state},
           gpu{gpu},
-          acquireFence{gpu.vkDevice, vk::FenceCreateInfo{}},
+          presentSemaphores{util::MakeFilledArray<vk::raii::Semaphore, MaxSwapchainImageCount>(gpu.vkDevice, vk::SemaphoreCreateInfo{})},
+          acquireSemaphores{util::MakeFilledArray<vk::raii::Semaphore, MaxSwapchainImageCount>(gpu.vkDevice, vk::SemaphoreCreateInfo{})},
           presentationTrack{static_cast<u64>(trace::TrackIds::Presentation), perfetto::ProcessTrack::Current()},
           vsyncEvent{std::make_shared<kernel::type::KEvent>(state, true)},
           choreographerThread{&PresentationEngine::ChoreographerThread, this},
@@ -97,6 +98,7 @@ namespace skyline::gpu {
         frame.fence.Wait(state.soc->host1x);
 
         std::scoped_lock textureLock(*frame.textureView);
+
         auto texture{frame.textureView->texture};
         if (frame.textureView->format != swapchainFormat || texture->dimensions != swapchainExtent)
             UpdateSwapchain(frame.textureView->format, texture->dimensions);
@@ -114,34 +116,36 @@ namespace skyline::gpu {
             windowScalingMode = frame.scalingMode;
         }
 
-        if (frame.transform != windowTransform) {
-            if ((result = window->perform(window, NATIVE_WINDOW_SET_BUFFERS_TRANSFORM, static_cast<i32>(frame.transform))))
-                throw exception("Setting the buffer transform to '{}' failed with {}", ToString(frame.transform), result);
-            windowTransform = frame.transform;
-        }
+        if ((result = window->perform(window, NATIVE_WINDOW_SET_BUFFERS_TRANSFORM, static_cast<i32>(frame.transform))))
+            throw exception("Setting the buffer transform to '{}' failed with {}", ToString(frame.transform), result);
+        windowTransform = frame.transform;
 
-        gpu.vkDevice.resetFences(*acquireFence);
+        auto &acquireSemaphore{acquireSemaphores[frameIndex]};
+        auto &frameFence{frameFences[frameIndex]};
+        if (frameFence)
+            frameFence->Wait();
+
+        frameIndex = (frameIndex + 1) % swapchainImageCount;
 
         std::pair<vk::Result, u32> nextImage;
-        while (nextImage = vkSwapchain->acquireNextImage(std::numeric_limits<u64>::max(), {}, *acquireFence), nextImage.first != vk::Result::eSuccess) [[unlikely]] {
+        while (nextImage = vkSwapchain->acquireNextImage(std::numeric_limits<u64>::max(), *acquireSemaphore, {}), nextImage.first != vk::Result::eSuccess) [[unlikely]] {
             if (nextImage.first == vk::Result::eSuboptimalKHR)
                 surfaceCondition.wait(lock, [this]() { return vkSurface.has_value(); });
             else
                 throw exception("vkAcquireNextImageKHR returned an unhandled result '{}'", vk::to_string(nextImage.first));
         }
-        auto &nextImageTexture{images.at(nextImage.second)};
 
-        std::ignore = gpu.vkDevice.waitForFences(*acquireFence, true, std::numeric_limits<u64>::max());
+        auto &nextImageTexture{images.at(nextImage.second)};
+        auto &presentSemaphore{presentSemaphores[nextImage.second]};
 
         texture->SynchronizeHost();
-        nextImageTexture->CopyFrom(texture, vk::ImageSubresourceRange{
+        nextImageTexture->CopyFrom(texture, *acquireSemaphore, *presentSemaphore, vk::ImageSubresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .levelCount = 1,
             .layerCount = 1,
         });
 
-        // Wait on the copy to the swapchain image to complete before submitting for presentation
-        nextImageTexture->WaitOnFence();
+        frameFence = nextImageTexture->cycle;
 
         auto getMonotonicNsNow{[]() -> i64 {
             timespec time;
@@ -192,6 +196,8 @@ namespace skyline::gpu {
                 .swapchainCount = 1,
                 .pSwapchains = &**vkSwapchain,
                 .pImageIndices = &nextImage.second,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = &*presentSemaphore,
             }); // We don't care about suboptimal images as they are caused by not respecting the transform hint, we handle transformations externally
         }
 
@@ -326,6 +332,7 @@ namespace skyline::gpu {
 
         swapchainFormat = format;
         swapchainExtent = extent;
+        swapchainImageCount = vkImages.size();
     }
 
     void PresentationEngine::UpdateSurface(jobject newSurface) {

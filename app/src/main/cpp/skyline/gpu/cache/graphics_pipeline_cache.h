@@ -29,6 +29,7 @@ namespace skyline::gpu::cache {
             const vk::PipelineMultisampleStateCreateInfo &multisampleState;
             const vk::PipelineDepthStencilStateCreateInfo &depthStencilState;
             const vk::PipelineColorBlendStateCreateInfo &colorBlendState;
+            const vk::PipelineDynamicStateCreateInfo &dynamicState;
 
             span<TextureView *> colorAttachments; //!< All color attachments in the subpass of this pipeline
             TextureView *depthStencilAttachment; //!< A nullable pointer to the depth/stencil attachment in the subpass of this pipeline
@@ -87,6 +88,7 @@ namespace skyline::gpu::cache {
             vk::PipelineMultisampleStateCreateInfo multisampleState;
             vk::PipelineDepthStencilStateCreateInfo depthStencilState;
             vk::PipelineColorBlendStateCreateInfo colorBlendState;
+            vk::PipelineDynamicStateCreateInfo dynamicState;
             std::vector<vk::PipelineColorBlendAttachmentState> colorBlendAttachments;
 
             std::vector<AttachmentMetadata> colorAttachments;
@@ -155,6 +157,6 @@ namespace skyline::gpu::cache {
          * @note Shader specializiation constants are **not** supported and will result in UB
          * @note Input/Resolve attachments are **not** supported and using them with the supplied pipeline will result in UB
          */
-        CompiledPipeline GetCompiledPipeline(const PipelineState& state, span<const vk::DescriptorSetLayoutBinding> layoutBindings, span<const vk::PushConstantRange> pushConstantRanges = {});
+        CompiledPipeline GetCompiledPipeline(const PipelineState& state, span<const vk::DescriptorSetLayoutBinding> layoutBindings, span<const vk::PushConstantRange> pushConstantRanges = {}, bool noPushDescriptors = false);
     };
 }

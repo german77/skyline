@@ -90,8 +90,24 @@ namespace skyline::service::account {
         return {};
     }
 
+    Result IAccountServiceForApplication::LoadOpenContext(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        return {};
+    }
+
+    Result IAccountServiceForApplication::ListOpenContextStoredUsers(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        try {
+            return WriteUserList(request.outputBuf.at(0), {constant::DefaultUserId});
+        } catch (const std::out_of_range &) {
+            return result::InvalidInputBuffer;
+        }
+    }
+
     Result IAccountServiceForApplication::IsUserAccountSwitchLocked(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         response.Push<u32>(0); // We don't want to lock the user
+        return {};
+    }
+
+    Result IAccountServiceForApplication::InitializeApplicationInfoV2(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         return {};
     }
 

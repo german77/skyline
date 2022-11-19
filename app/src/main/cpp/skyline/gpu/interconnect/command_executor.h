@@ -4,27 +4,81 @@
 #pragma once
 
 #include <boost/container/stable_vector.hpp>
-#include <unordered_set>
+#include <renderdoc_app.h>
 #include <common/linear_allocator.h>
 #include <gpu/megabuffer.h>
 #include "command_nodes.h"
 
 namespace skyline::gpu::interconnect {
+    /*
+     * @brief Thread responsible for recording Vulkan commands from the execution nodes and submitting them
+     */
+    class CommandRecordThread {
+      public:
+        /**
+         * @brief Single execution slot, buffered back and forth between the GPFIFO thread and the record thread
+         */
+        struct Slot {
+            vk::raii::CommandPool commandPool; //!< Use one command pool per slot since command buffers from different slots may be recorded into on multiple threads at the same time
+            vk::raii::CommandBuffer commandBuffer;
+            vk::raii::Fence fence;
+            vk::raii::Semaphore semaphore;
+            std::shared_ptr<FenceCycle> cycle;
+            boost::container::stable_vector<node::NodeVariant> nodes;
+            LinearAllocatorState<> allocator;
+            u32 executionNumber;
+            bool capture{}; //!< If this slot's Vulkan commands should be captured using the renderdoc API
+
+            Slot(GPU &gpu);
+
+            Slot(Slot &&other);
+
+            /**
+             * @brief Waits on the fence and resets the command buffer
+             * @note A new fence cycle for the reset command buffer
+             */
+            std::shared_ptr<FenceCycle> Reset(GPU &gpu);
+        };
+
+      private:
+        const DeviceState &state;
+        CircularQueue<Slot *> incoming; //!< Slots pending recording
+        CircularQueue<Slot *> outgoing; //!< Slots that have been submitted, may still be active on the GPU
+
+        std::thread thread;
+
+        void ProcessSlot(Slot *slot);
+
+        void Run();
+
+      public:
+        CommandRecordThread(const DeviceState &state);
+
+        /**
+         * @return A free slot, `Reset` needs to be called before accessing it
+         */
+        Slot *AcquireSlot();
+
+        /**
+         * @brief Submit a slot to be recorded
+         */
+        void ReleaseSlot(Slot *slot);
+    };
+
     /**
      * @brief Assembles a Vulkan command stream with various nodes and manages execution of the produced graph
      * @note This class is **NOT** thread-safe and should **ONLY** be utilized by a single thread
      */
     class CommandExecutor {
       private:
+        const DeviceState &state;
         GPU &gpu;
-        CommandScheduler::ActiveCommandBuffer activeCommandBuffer;
-        boost::container::stable_vector<node::NodeVariant> nodes;
+        CommandRecordThread recordThread;
+        CommandRecordThread::Slot *slot{};
         node::RenderPassNode *renderPass{};
         size_t subpassCount{}; //!< The number of subpasses in the current render pass
-
-        std::optional<std::scoped_lock<TextureManager>> textureManagerLock; //!< The lock on the texture manager, this is locked for the duration of the command execution from the first usage inside an execution to the submission
-        std::optional<std::scoped_lock<BufferManager>> bufferManagerLock; //!< The lock on the buffer manager, see above for details
-        std::optional<std::scoped_lock<MegaBufferAllocator>> megaBufferAllocatorLock; //!< The lock on the megabuffer allocator, see above for details
+        u32 renderPassIndex{};
+        bool preserveLocked{};
 
         /**
          * @brief A wrapper of a Texture object that has been locked beforehand and must be unlocked afterwards
@@ -43,6 +97,7 @@ namespace skyline::gpu::interconnect {
             ~LockedTexture();
         };
 
+        std::vector<LockedTexture> preserveAttachedTextures;
         std::vector<LockedTexture> attachedTextures; //!< All textures that are attached to the current execution
 
         /**
@@ -62,10 +117,9 @@ namespace skyline::gpu::interconnect {
             ~LockedBuffer();
         };
 
+        std::vector<LockedBuffer> preserveAttachedBuffers;
         std::vector<LockedBuffer> attachedBuffers; //!< All textures that are attached to the current execution
 
-        using SharedBufferDelegate = std::shared_ptr<Buffer::BufferDelegate>;
-        std::vector<SharedBufferDelegate> attachedBufferDelegates; //!< All buffers that are attached to the current execution
 
         std::vector<TextureView *> lastSubpassAttachments; //!< The storage backing for attachments used in the last subpass
         span<TextureView *> lastSubpassInputAttachments; //!< The set of input attachments used in the last subpass
@@ -73,13 +127,17 @@ namespace skyline::gpu::interconnect {
         TextureView *lastSubpassDepthStencilAttachment{}; //!< The depth stencil attachment used in the last subpass
 
         std::vector<std::function<void()>> flushCallbacks; //!< Set of persistent callbacks that will be called at the start of Execute in order to flush data required for recording
+        std::vector<std::function<void()>> pipelineChangeCallbacks; //!< Set of persistent callbacks that will be called after any non-Maxwell 3D engine changes the active pipeline
+
+        void RotateRecordSlot();
 
         /**
          * @brief Create a new render pass and subpass with the specified attachments, if one doesn't already exist or the current one isn't compatible
+         * @param noSubpassCreation Forces creation of a renderpass when a new subpass would otherwise be created
          * @note This also checks for subpass coalescing and will merge the new subpass with the previous one when possible
          * @return If the next subpass must be started prior to issuing any commands
          */
-        bool CreateRenderPassWithSubpass(vk::Rect2D renderArea, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment);
+        bool CreateRenderPassWithSubpass(vk::Rect2D renderArea, span<TextureView *> sampledImages, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment, bool noSubpassCreation = false);
 
         /**
          * @brief Ends a render pass if one is currently active and resets all corresponding state
@@ -97,20 +155,19 @@ namespace skyline::gpu::interconnect {
          */
         void ResetInternal();
 
+        void AttachBufferBase(std::shared_ptr<Buffer> buffer);
+
       public:
         std::shared_ptr<FenceCycle> cycle; //!< The fence cycle that this command executor uses to wait for the GPU to finish executing commands
-        LinearAllocatorState<> allocator;
+        LinearAllocatorState<> *allocator;
         ContextTag tag; //!< The tag associated with this command executor, any tagged resource locking must utilize this tag
+        size_t submissionNumber{};
+        u32 executionNumber{};
+        bool captureNextExecution{};
 
         CommandExecutor(const DeviceState &state);
 
         ~CommandExecutor();
-
-        /**
-         * @return A reference to an instance of the Texture Manager which will be locked till execution
-         * @note Any access to the texture manager while recording commands **must** be done via this
-         */
-        TextureManager &AcquireTextureManager();
 
         /**
          * @brief Attach the lifetime of the texture to the command buffer
@@ -121,24 +178,12 @@ namespace skyline::gpu::interconnect {
         bool AttachTexture(TextureView *view);
 
         /**
-         * @return A reference to an instance of the Buffer Manager which will be locked till execution
-         * @note Any access to the buffer manager while recording commands **must** be done via this
-         */
-        BufferManager &AcquireBufferManager();
-
-        /**
          * @brief Attach the lifetime of a buffer view to the command buffer
          * @return If this is the first usage of the backing of this resource within this execution
          * @note The supplied buffer will be locked automatically until the command buffer is submitted and must **not** be locked by the caller
          * @note This'll automatically handle syncing of the buffer in the most optimal way possible
          */
         bool AttachBuffer(BufferView &view);
-
-        /**
-         * @return A reference to an instance of the megabuffer allocator which will be locked till execution
-         * @note Any access to the megabuffer allocator while recording commands **must** be done via this
-         */
-        MegaBufferAllocator &AcquireMegaBufferAllocator();
 
         /**
          * @brief Attach the lifetime of a buffer view that's already locked to the command buffer
@@ -166,7 +211,7 @@ namespace skyline::gpu::interconnect {
          * @param exclusiveSubpass If this subpass should be the only subpass in a render pass
          * @note Any supplied texture should be attached prior and not undergo any persistent layout transitions till execution
          */
-        void AddSubpass(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32)> &&function, vk::Rect2D renderArea, span<TextureView *> inputAttachments = {}, span<TextureView *> colorAttachments = {}, TextureView *depthStencilAttachment = {}, bool exclusiveSubpass = false);
+        void AddSubpass(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32)> &&function, vk::Rect2D renderArea, span<TextureView *> sampledImages, span<TextureView *> inputAttachments = {}, span<TextureView *> colorAttachments = {}, TextureView *depthStencilAttachment = {}, bool noSubpassCreation = false);
 
         /**
          * @brief Adds a subpass that clears the entirety of the specified attachment with a color value, it may utilize VK_ATTACHMENT_LOAD_OP_CLEAR for a more efficient clear when possible
@@ -191,13 +236,30 @@ namespace skyline::gpu::interconnect {
         void AddFlushCallback(std::function<void()> &&callback);
 
         /**
+         * @brief Adds a persistent callback that will be called after any non-Maxwell 3D engine changes the active pipeline
+         */
+        void AddPipelineChangeCallback(std::function<void()> &&callback);
+
+        /**
+         * @brief Calls all registered pipeline change callbacks
+         */
+        void NotifyPipelineChange();
+
+        /**
          * @brief Execute all the nodes and submit the resulting command buffer to the GPU
          */
         void Submit();
 
         /**
-         * @brief Execute all the nodes and submit the resulting command buffer to the GPU then wait for the completion of the command buffer
+         * @brief Locks all preserve attached buffers/textures
+         * @note This **MUST** be called before attaching any buffers/textures to an execution
          */
-        void SubmitWithFlush();
+        void LockPreserve();
+
+        /**
+         * @brief Unlocks all preserve attached buffers/textures
+         * @note This **MUST** be called when there is no GPU work left to be done to avoid deadlocks where the guest will try to lock a buffer/texture but the GPFIFO thread has no work so won't periodically unlock it
+         */
+        void UnlockPreserve();
     };
 }

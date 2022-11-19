@@ -18,8 +18,7 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import androidx.core.content.res.use
 import androidx.core.graphics.drawable.toBitmap
-import androidx.core.view.isInvisible
-import androidx.core.view.isVisible
+import androidx.core.view.*
 import androidx.documentfile.provider.DocumentFile
 import androidx.preference.PreferenceManager
 import androidx.recyclerview.widget.GridLayoutManager
@@ -100,6 +99,13 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         setContentView(binding.root)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Apply inset padding to the app list recycler view to avoid navigation bar overlap
+        ViewCompat.setOnApplyWindowInsetsListener(binding.appList) { view, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.updatePadding(bottom = insets.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
 
         PreferenceManager.setDefaultValues(this, R.xml.preferences, false)
 
@@ -245,7 +251,7 @@ class MainActivity : AppCompatActivity() {
         if (preferenceSettings.selectAction) {
             AppDialog.newInstance(appItem).show(supportFragmentManager, "game")
         } else if (appItem.loaderResult == LoaderResult.Success) {
-            startActivity(Intent(this, EmulationActivity::class.java).apply { data = appItem.uri; putExtra(EmulationActivity.ReturnToMainTag, true) })
+            startActivity(Intent(this, EmulationActivity::class.java).apply { data = appItem.uri; putExtra(EmulationActivity.ReturnToMainTag, true); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) })
         }
     }
 

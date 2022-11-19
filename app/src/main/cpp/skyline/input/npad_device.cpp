@@ -10,7 +10,14 @@ namespace skyline::input {
         : manager(manager),
           section(section),
           id(id),
-          updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {}
+          updateEvent(std::make_shared<kernel::type::KEvent>(manager.state, false)) {
+        constexpr std::size_t InitializeEntryCount{19}; //!< HW initializes the first 19 entries
+
+        ResetDeviceProperties();
+        for (std::size_t i{}; i < InitializeEntryCount; ++i) {
+            WriteEmptyEntries();
+        }
+    }
 
     void NpadDevice::Connect(NpadControllerType newType) {
         if (type == newType) {
@@ -29,10 +36,11 @@ namespace skyline::input {
             return;
         }
 
-        section = {};
+        ResetDeviceProperties();
         controllerInfo = nullptr;
 
-        connectionState = {.connected = true};
+        connectionState.raw = 0;
+        connectionState.connected = true;
 
         switch (newType) {
             case NpadControllerType::ProController:
@@ -154,8 +162,7 @@ namespace skyline::input {
         if (type == NpadControllerType::None)
             return;
 
-        section = {};
-        globalTimestamp = 0;
+        ResetDeviceProperties();
 
         index = -1;
         partnerIndex = -1;
@@ -164,6 +171,7 @@ namespace skyline::input {
         controllerInfo = nullptr;
 
         updateEvent->Signal();
+        WriteEmptyEntries();
     }
 
     NpadControllerInfo &NpadDevice::GetControllerInfo() {
@@ -188,8 +196,8 @@ namespace skyline::input {
 
         info.header.timestamp = util::GetTimeTicks();
         info.header.entryCount = std::min(static_cast<u8>(info.header.entryCount + 1), constant::HidEntryCount);
-        info.header.maxEntry = info.header.entryCount;
-        info.header.currentEntry = (info.header.currentEntry != constant::HidEntryCount - 1) ? info.header.currentEntry + 1 : 0;
+        info.header.maxEntry = info.header.entryCount - 1;
+        info.header.currentEntry = (info.header.currentEntry < info.header.maxEntry) ? info.header.currentEntry + 1 : 0;
 
         auto &nextEntry{info.state.at(info.header.currentEntry)};
 
@@ -203,11 +211,42 @@ namespace skyline::input {
         nextEntry.status.raw = connectionState.raw;
     }
 
+    void NpadDevice::WriteEmptyEntries() {
+        NpadControllerState emptyEntry{};
+
+        WriteNextEntry(section.fullKeyController, emptyEntry);
+        WriteNextEntry(section.handheldController, emptyEntry);
+        WriteNextEntry(section.leftController, emptyEntry);
+        WriteNextEntry(section.rightController, emptyEntry);
+        WriteNextEntry(section.palmaController, emptyEntry);
+        WriteNextEntry(section.dualController, emptyEntry);
+        WriteNextEntry(section.defaultController, emptyEntry);
+
+        globalTimestamp++;
+    }
+
+    void NpadDevice::ResetDeviceProperties() {
+        // Don't reset assignment mode or ring lifo entries these values are persistent
+        section.header.type = NpadControllerType::None;
+        section.header.singleColor = {};
+        section.header.leftColor = {};
+        section.header.rightColor = {};
+        section.header.singleColorStatus =  NpadColorReadStatus::Disconnected;
+        section.header.dualColorStatus = NpadColorReadStatus::Disconnected;
+        section.deviceType.raw = 0;
+        section.buttonProperties.raw = 0;
+        section.systemProperties.raw = 0;
+        section.singleBatteryLevel = NpadBatteryLevel::Empty;
+        section.leftBatteryLevel = NpadBatteryLevel::Empty;
+        section.rightBatteryLevel = NpadBatteryLevel::Empty;
+    }
+
     void NpadDevice::UpdateSharedMemory() {
         if (!connectionState.connected)
             return;
 
-        WriteNextEntry(*controllerInfo, controllerState);
+        if (controllerInfo)
+            WriteNextEntry(*controllerInfo, controllerState);
         WriteNextEntry(section.defaultController, defaultState);
 
         globalTimestamp++;

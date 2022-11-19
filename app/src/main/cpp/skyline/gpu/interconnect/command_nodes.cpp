@@ -40,6 +40,7 @@ namespace skyline::gpu::interconnect::node {
                 .format = *view->format,
                 .initialLayout = view->texture->layout,
                 .finalLayout = view->texture->layout,
+                .flags = vk::AttachmentDescriptionFlagBits::eMayAlias
             });
             return static_cast<u32>(attachments.size() - 1);
         } else {
@@ -104,8 +105,8 @@ namespace skyline::gpu::interconnect::node {
                 dependency.dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead;
             } else if (view->format->vkAspect & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) {
                 dependency.srcStageMask = vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests;
-                dependency.srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead;
-                dependency.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+                dependency.srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+                dependency.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead;
             }
 
             if (std::find(subpassDependencies.begin(), subpassDependencies.end(), dependency) == subpassDependencies.end())
@@ -128,10 +129,16 @@ namespace skyline::gpu::interconnect::node {
 
         auto colorAttachmentsOffset{attachmentReferences.size() * sizeof(vk::AttachmentReference)}; // Calculate new base offset as it has changed since we pushed the input attachments
         for (auto &attachment : colorAttachments) {
-            attachmentReferences.push_back(vk::AttachmentReference{
-                .attachment = AddAttachment(attachment, gpu),
-                .layout = attachment->texture->layout,
-            });
+            if (attachment)
+                attachmentReferences.push_back(vk::AttachmentReference{
+                    .attachment = AddAttachment(attachment, gpu),
+                    .layout = attachment->texture->layout,
+                });
+            else
+                attachmentReferences.push_back(vk::AttachmentReference{
+                    .attachment = VK_ATTACHMENT_UNUSED,
+                    .layout = vk::ImageLayout::eUndefined,
+                });
         }
 
         auto depthStencilAttachmentOffset{attachmentReferences.size() * sizeof(vk::AttachmentReference)};

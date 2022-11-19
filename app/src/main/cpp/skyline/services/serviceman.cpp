@@ -34,18 +34,26 @@
 #include "aocsrv/IAddOnContentManager.h"
 #include "pctl/IParentalControlServiceFactory.h"
 #include "lm/ILogService.h"
+#include "ldn/IUserServiceCreator.h"
 #include "account/IAccountServiceForApplication.h"
 #include "friends/IServiceCreator.h"
 #include "nfp/IUserManager.h"
 #include "nifm/IStaticService.h"
 #include "nim/IShopServiceAccessServerInterface.h"
 #include "socket/bsd/IClient.h"
+#include "socket/nsd/IManager.h"
+#include "socket/sfdnsres/IResolver.h"
 #include "spl/IRandomInterface.h"
 #include "ssl/ISslService.h"
 #include "prepo/IPrepoService.h"
 #include "mmnv/IRequest.h"
 #include "bt/IBluetoothUser.h"
 #include "btm/IBtmUser.h"
+#include "capsrv/IAlbumAccessorService.h"
+#include "capsrv/ICaptureControllerService.h"
+#include "capsrv/IAlbumApplicationService.h"
+#include "capsrv/IScreenShotApplicationService.h"
+#include "ro/IRoInterface.h"
 #include "serviceman.h"
 
 #define SERVICE_CASE(class, name, ...) \
@@ -106,11 +114,15 @@ namespace skyline::service {
             SERVICE_CASE(pctl::IParentalControlServiceFactory, "pctl:s")
             SERVICE_CASE(pctl::IParentalControlServiceFactory, "pctl:r")
             SERVICE_CASE(lm::ILogService, "lm")
+            SERVICE_CASE(ldn::IUserServiceCreator, "ldn:u")
             SERVICE_CASE(account::IAccountServiceForApplication, "acc:u0")
             SERVICE_CASE(friends::IServiceCreator, "friend:u")
             SERVICE_CASE(nfp::IUserManager, "nfp:user")
             SERVICE_CASE(nifm::IStaticService, "nifm:u")
             SERVICE_CASE(socket::IClient, "bsd:u")
+            SERVICE_CASE(socket::IManager, "nsd:u")
+            SERVICE_CASE(socket::IManager, "nsd:a")
+            SERVICE_CASE(socket::IResolver, "sfdnsres")
             SERVICE_CASE(spl::IRandomInterface, "csrng")
             SERVICE_CASE(ssl::ISslService, "ssl")
             SERVICE_CASE(prepo::IPrepoService, "prepo:u")
@@ -118,7 +130,12 @@ namespace skyline::service {
             SERVICE_CASE(bcat::IServiceCreator, "bcat:u")
             SERVICE_CASE(bt::IBluetoothUser, "bt")
             SERVICE_CASE(btm::IBtmUser, "btm:u")
+            SERVICE_CASE(capsrv::IAlbumAccessorService, "caps:a")
+            SERVICE_CASE(capsrv::ICaptureControllerService, "caps:c")
+            SERVICE_CASE(capsrv::IAlbumApplicationService, "caps:u")
+            SERVICE_CASE(capsrv::IScreenShotApplicationService, "caps:su")
             SERVICE_CASE(nim::IShopServiceAccessServerInterface, "nim:eca")
+            SERVICE_CASE(ro::IRoInterface, "ldr:ro")
             default:
                 std::string_view nameString(span(reinterpret_cast<char *>(&name), sizeof(name)).as_string(true));
                 throw std::out_of_range(fmt::format("CreateService called with an unknown service name: {}", nameString));

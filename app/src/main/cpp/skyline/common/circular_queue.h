@@ -76,6 +76,21 @@ namespace skyline {
             }
         }
 
+        Type Pop() {
+            std::unique_lock lock(productionMutex);
+            produceCondition.wait(lock, [this]() { return start != end; });
+
+            auto next{start + 1};
+            next = (next == reinterpret_cast<Type *>(vector.end().base())) ? reinterpret_cast<Type *>(vector.begin().base()) : next;
+            Type item{*next};
+            start = next;
+
+            if (start == end)
+                consumeCondition.notify_one();
+
+            return item;
+        }
+
         void Push(const Type &item) {
             std::unique_lock lock(productionMutex);
             auto next{end + 1};
@@ -111,7 +126,7 @@ namespace skyline {
         template<typename TransformedType, typename Transformation>
         void AppendTranform(span <TransformedType> buffer, Transformation transformation) {
             std::unique_lock lock(productionMutex);
-            for (const auto &item : buffer) {
+            for (auto &item : buffer) {
                 auto next{end + 1};
                 next = (next == reinterpret_cast<Type *>(vector.end().base())) ? reinterpret_cast<Type *>(vector.begin().base()) : next;
                 if (next == start) {

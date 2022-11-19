@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <common/linear_allocator.h>
 #include <common/segment_table.h>
+#include <common/spin_lock.h>
 #include "buffer.h"
 
 namespace skyline::gpu {
@@ -13,13 +15,12 @@ namespace skyline::gpu {
     class BufferManager {
       private:
         GPU &gpu;
-        std::mutex mutex; //!< Synchronizes access to the buffer mappings
         std::vector<std::shared_ptr<Buffer>> bufferMappings; //!< A sorted vector of all buffer mappings
+        LinearAllocatorState<> delegateAllocatorState; //!< Linear allocator used to allocate buffer delegates
+        size_t nextBufferId{}; //!< The next unique buffer id to be assigned
 
-        static constexpr size_t AddressSpaceSize{1ULL << 39}; //!< The size of the guest CPU AS in bytes
-        static constexpr size_t PageSizeBits{12}; //!< The size of a single page of the guest CPU AS as a power of two (4 KiB == 1 << 12)
         static constexpr size_t L2EntryGranularity{19}; //!< The amount of AS (in bytes) a single L2 PTE covers (512 KiB == 1 << 19)
-        SegmentTable<Buffer*, AddressSpaceSize, PageSizeBits, L2EntryGranularity> bufferTable; //!< A page table of all buffer mappings for O(1) lookups on full matches
+        SegmentTable<Buffer *, constant::AddressSpaceSize, constant::PageSizeBits, L2EntryGranularity> bufferTable; //!< A page table of all buffer mappings for O(1) lookups on full matches
 
         /**
          * @brief A wrapper around a Buffer which locks it with the specified ContextTag
@@ -27,7 +28,7 @@ namespace skyline::gpu {
         struct LockedBuffer {
             std::shared_ptr<Buffer> buffer;
             ContextLock<Buffer> lock;
-            std::unique_lock<std::recursive_mutex> stateLock;
+            std::unique_lock<RecursiveSpinLock> stateLock;
 
             LockedBuffer(std::shared_ptr<Buffer> pBuffer, ContextTag tag);
 
@@ -68,6 +69,8 @@ namespace skyline::gpu {
         static bool BufferLessThan(const std::shared_ptr<Buffer> &it, u8 *pointer);
 
       public:
+        std::mutex recreationMutex;
+
         BufferManager(GPU &gpu);
 
         /**
@@ -93,6 +96,15 @@ namespace skyline::gpu {
          * @return A pre-existing or newly created Buffer object which covers the supplied mappings
          * @note The buffer manager **must** be locked prior to calling this
          */
-        BufferView FindOrCreate(GuestBuffer guestMapping, ContextTag tag = {}, const std::function<void(std::shared_ptr<Buffer>, ContextLock<Buffer> &&)> &attachBuffer = {});
+        BufferView FindOrCreateImpl(GuestBuffer guestMapping, ContextTag tag, const std::function<void(std::shared_ptr<Buffer>, ContextLock<Buffer> &&)> &attachBuffer);
+
+        BufferView FindOrCreate(GuestBuffer guestMapping, ContextTag tag = {}, const std::function<void(std::shared_ptr<Buffer>, ContextLock<Buffer> &&)> &attachBuffer = {}) {
+            auto lookupBuffer{bufferTable[guestMapping.begin().base()]};
+            if (lookupBuffer != nullptr)
+                if (auto view{lookupBuffer->TryGetView(guestMapping)}; view)
+                    return view;
+
+            return FindOrCreateImpl(guestMapping, tag, attachBuffer);
+        }
     };
 }

@@ -132,9 +132,10 @@ namespace skyline::gpu {
             .multisampleState = multisampleState,
             .depthStencilState = depthStencilState,
             .colorBlendState = blendState,
+            .dynamicState = {},
             .colorAttachments = span<TextureView *>{colorAttachment},
             .depthStencilAttachment = nullptr,
-        }, layoutBindings, pushConstantRanges);
+        }, layoutBindings, pushConstantRanges, true);
     }
 
     namespace glsl {

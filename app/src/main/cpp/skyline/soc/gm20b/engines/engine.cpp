@@ -10,7 +10,10 @@ namespace skyline::soc::gm20b::engine {
 
         i64 nsTime{util::GetTimeNs()};
         i64 timestamp{(nsTime / NsToTickDenominator) * NsToTickNumerator + ((nsTime % NsToTickDenominator) * NsToTickNumerator) / NsToTickDenominator};
-        return static_cast<u64>(timestamp);
+
+        // By reporting that less time has passed on the  GPU than has actually passed we can avoid dynamic resolution kicking in
+        // TODO: add a setting for this after global settings
+        return static_cast<u64>(timestamp / 256);
     }
 
     MacroEngineBase::MacroEngineBase(MacroState &macroState) : macroState(macroState) {}
@@ -20,7 +23,7 @@ namespace skyline::soc::gm20b::engine {
         if (!(macroMethodOffset & 1)) {
             // Flush the current macro as we are switching to another one
             if (macroInvocation.Valid()) {
-                macroState.macroInterpreter.Execute(macroState.macroPositions[macroInvocation.index], macroInvocation.arguments, this);
+                macroState.Execute(macroInvocation.index, macroInvocation.arguments, this);
                 macroInvocation.Reset();
             }
 
@@ -32,7 +35,7 @@ namespace skyline::soc::gm20b::engine {
 
         // Flush macro after all of the data in the method call has been sent
         if (lastCall && macroInvocation.Valid()) {
-            macroState.macroInterpreter.Execute(macroState.macroPositions[macroInvocation.index], macroInvocation.arguments, this);
+            macroState.Execute(macroInvocation.index, macroInvocation.arguments, this);
             macroInvocation.Reset();
         }
     };

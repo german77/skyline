@@ -210,6 +210,7 @@ namespace skyline::kernel {
             lower->state = chunk.state;
             lower->permission = chunk.permission;
             lower->attributes = chunk.attributes;
+            lower->memory = chunk.memory;
         } else if (lower->ptr + lower->size > chunk.ptr + chunk.size) {
             auto lowerExtension{*lower};
             lowerExtension.ptr = chunk.ptr + chunk.size;
@@ -266,6 +267,6 @@ namespace skyline::kernel {
     size_t MemoryManager::GetSystemResourceUsage() {
         std::shared_lock lock(mutex);
         constexpr size_t KMemoryBlockSize{0x40};
-        return std::min(static_cast<size_t>(state.process->npdm.meta.systemResourceSize), util::AlignUp(chunks.size() * KMemoryBlockSize, PAGE_SIZE));
+        return std::min(static_cast<size_t>(state.process->npdm.meta.systemResourceSize), util::AlignUp(chunks.size() * KMemoryBlockSize, constant::PageSize));
     }
 }

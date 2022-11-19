@@ -7,7 +7,7 @@
 #include <soc/gm20b/macro/macro_state.h>
 
 #define U32_OFFSET(regs, field) (offsetof(regs, field) / sizeof(u32))
-#define ENGINE_OFFSET(field) (sizeof(typeof(Registers::field)) - sizeof(std::remove_reference_t<decltype(*Registers::field)>)) / sizeof(u32)
+#define ENGINE_OFFSET(field) (sizeof(decltype(Registers::field)) - sizeof(std::remove_reference_t<decltype(*Registers::field)>)) / sizeof(u32)
 #define ENGINE_STRUCT_OFFSET(field, member) ENGINE_OFFSET(field) + U32_OFFSET(std::remove_reference_t<decltype(*Registers::field)>, member)
 #define ENGINE_STRUCT_STRUCT_OFFSET(field, member, submember) ENGINE_STRUCT_OFFSET(field, member) + U32_OFFSET(std::remove_reference_t<decltype(Registers::field->member)>, submember)
 #define ENGINE_STRUCT_ARRAY_OFFSET(field, member, index) ENGINE_STRUCT_OFFSET(field, member) + ((sizeof(std::remove_reference_t<decltype(Registers::field->member[0])>) / sizeof(u32)) * index)
@@ -47,7 +47,7 @@ namespace skyline::soc::gm20b::engine {
     };
     static_assert(sizeof(Address) == sizeof(u64));
 
-    constexpr u32 EngineMethodsEnd = 0xE00; //!< All methods above this are passed to the MME on supported engines
+    constexpr u32 EngineMethodsEnd{0xE00}; //!< All methods above this are passed to the MME on supported engines
 
     /**
      * @brief Returns current time in GPU ticks
@@ -61,15 +61,15 @@ namespace skyline::soc::gm20b::engine {
         MacroState &macroState;
 
         struct {
-            size_t index{std::numeric_limits<size_t>::max()};
+            u32 index{std::numeric_limits<u32>::max()};
             std::vector<u32> arguments;
 
             bool Valid() {
-                return index != std::numeric_limits<size_t>::max();
+                return index != std::numeric_limits<u32>::max();
             }
 
             void Reset() {
-                index = std::numeric_limits<size_t>::max();
+                index = std::numeric_limits<u32>::max();
                 arguments.clear();
             }
         } macroInvocation{}; //!< Data for a macro that is pending execution
@@ -87,6 +87,14 @@ namespace skyline::soc::gm20b::engine {
          * @brief Reads the current value for the supplied method
          */
         virtual u32 ReadMethodFromMacro(u32 method) = 0;
+
+        virtual void DrawInstanced(bool setRegs, u32 drawTopology, u32 vertexArrayCount, u32 instanceCount, u32 vertexArrayStart, u32 globalBaseInstanceIndex) {
+            throw exception("DrawInstanced is not implemented for this engine");
+        }
+
+        virtual void DrawIndexedInstanced(bool setRegs, u32 drawTopology, u32 indexBufferCount, u32 instanceCount, u32 globalBaseVertexIndex, u32 indexBufferFirst, u32 globalBaseInstanceIndex) {
+            throw exception("DrawIndexedInstanced is not implemented for this engine");
+        }
 
         /**
          * @brief Handles a call to a method in the MME space

@@ -8,6 +8,7 @@
 #include <span>
 #include <frozen/unordered_map.h>
 #include <frozen/string.h>
+#include <type_traits>
 #include <xxhash.h>
 #include "base.h"
 #include "exception.h"
@@ -115,7 +116,7 @@ namespace skyline::util {
     template<typename TypeVal>
     requires IsPointerOrUnsignedIntegral<TypeVal>
     constexpr bool IsPageAligned(TypeVal value) {
-        return IsAligned(value, PAGE_SIZE);
+        return IsAligned(value, constant::PageSize);
     }
 
     template<typename TypeVal>
@@ -263,6 +264,12 @@ namespace skyline::util {
         FillRandomBytes(std::span(reinterpret_cast<typename IntegerFor<T>::Type *>(&object), IntegerFor<T>::Count));
     }
 
+    template<IsPointerOrUnsignedIntegral T>
+    T RandomNumber(T min, T max) {
+        std::uniform_int_distribution dist(PointerValue(min), PointerValue(max));
+        return ValuePointer<T>(dist(detail::generator));
+    }
+
     /**
      * @brief A temporary shim for C++ 20's bit_cast to make transitioning to it easier
      */
@@ -287,8 +294,12 @@ namespace skyline::util {
             return *this;
         }
 
-        auto operator[](std::size_t index) {
+        const auto &operator[](std::size_t index) const {
             return value[index];
+        }
+
+        const ValueType &operator*() const {
+            return value;
         }
 
         ValueType &operator*() {
@@ -308,5 +319,48 @@ namespace skyline::util {
     template<typename T, size_t Size, typename... TArgs>
     std::array<T, Size> MakeFilledArray(TArgs &&... args) {
         return MakeFilledArray<T>(std::make_index_sequence<Size>(), std::forward<TArgs>(args)...);
+    }
+
+    template<typename T>
+    struct IncrementingT {
+        using Type = T;
+    };
+
+
+    template<typename T>
+    struct IsIncrementingT : std::false_type {};
+
+    template<typename T>
+    struct IsIncrementingT<IncrementingT<T>> : std::true_type {};
+
+    template<typename T, size_t Index, typename... TSrcs>
+    T MakeMergeElem(TSrcs &&... srcs) {
+        auto readElem{[index = Index](auto &&src) -> decltype(auto) {
+            using SrcType = std::decay_t<decltype(src)>;
+            if constexpr (requires { src[Index]; })
+                return src[Index];
+            else if constexpr (IsIncrementingT<SrcType>{})
+                return static_cast<typename SrcType::Type>(index);
+            else
+                return src;
+        }};
+        return T{readElem(std::forward<TSrcs>(srcs))...};
+    }
+
+    template<typename T, size_t... Is, typename... TSrcs>
+    std::array<T, sizeof...(Is)> MergeInto(std::index_sequence<Is...> seq, TSrcs &&... srcs) {
+        return {MakeMergeElem<T, Is>(std::forward<TSrcs>(srcs)...)...};
+    }
+
+    /**
+     * @brief Constructs {{scalar0, array0[0], array1[0], ... arrayN[0], scalar1}, {scalar0, array0[1], array1[1]. ... arrayN[1], scalar0}, ...}
+     */
+    template<typename T, size_t Size, typename... TSrcs>
+    std::array<T, Size> MergeInto(TSrcs &&... srcs) {
+        return MergeInto<T>(std::make_index_sequence<Size>(), std::forward<TSrcs>(srcs)...);
+    }
+
+    inline std::string HexDump(std::span<u8> data) {
+        return std::accumulate(data.begin(), data.end(), std::string{}, [](std::string str, u8 el) { return std::move(str) + fmt::format("{:02X}", el); });
     }
 }

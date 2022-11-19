@@ -19,23 +19,23 @@ namespace skyline::gpu {
         using DescriptorSizes = std::array<vk::DescriptorPoolSize, 5>;
         constexpr DescriptorSizes BaseDescriptorSizes{
             vk::DescriptorPoolSize{
-                .descriptorCount = maxwell3d::PipelineStageConstantBufferCount,
+                .descriptorCount = maxwell3d::ShaderStageConstantBufferCount,
                 .type = vk::DescriptorType::eUniformBuffer,
             },
             vk::DescriptorPoolSize{
-                .descriptorCount = maxwell3d::PipelineStageCount * 5,
+                .descriptorCount = maxwell3d::ShaderStageCount * 5,
                 .type = vk::DescriptorType::eStorageBuffer,
             },
             vk::DescriptorPoolSize{
-                .descriptorCount = maxwell3d::PipelineStageCount * 5,
+                .descriptorCount = maxwell3d::ShaderStageCount * 5,
                 .type = vk::DescriptorType::eCombinedImageSampler,
             },
             vk::DescriptorPoolSize{
-                .descriptorCount = maxwell3d::PipelineStageCount,
+                .descriptorCount = maxwell3d::ShaderStageCount,
                 .type = vk::DescriptorType::eStorageImage,
             },
             vk::DescriptorPoolSize{
-                .descriptorCount = maxwell3d::RenderTargetCount,
+                .descriptorCount = maxwell3d::ColorTargetCount,
                 .type = vk::DescriptorType::eInputAttachment,
             },
         }; //!< A best approximate ratio of descriptors of each type that may be utilized, the total amount will grow in these ratios
@@ -94,14 +94,19 @@ namespace skyline::gpu {
         vk::Result lastResult{};
         if (it != pool->layoutSlots.end()) {
             auto &slots{it->second};
-            for (auto &slot : it->second)
-                if (!slot.active.test_and_set(std::memory_order_acq_rel))
-                    return ActiveDescriptorSet{pool, &slot};
+            for (auto slotIt{it->second.begin()} ; slotIt != it->second.end() ; slotIt++) {
+                if (!slotIt->active.test_and_set(std::memory_order_acq_rel)) {
+                    // Move active slots to end of list to reduce search time
+                    it->second.splice(it->second.end(), it->second, slotIt);
+                    return ActiveDescriptorSet{pool, &*slotIt};
+                }
+            }
 
             // If we couldn't find an available slot, we need to allocate a new one
             auto set{AllocateVkDescriptorSet(layout)};
             if (set.result == vk::Result::eSuccess) {
                 auto &slot{slots.emplace_back(set.value)};
+                slot.active.test_and_set(std::memory_order_release);
                 return ActiveDescriptorSet{pool, &slot};
             } else {
                 lastResult = set.result;
@@ -111,7 +116,9 @@ namespace skyline::gpu {
             auto set{AllocateVkDescriptorSet(layout)};
             if (set.result == vk::Result::eSuccess) {
                 auto &layoutSlots{pool->layoutSlots.try_emplace(layout).first->second};
-                return ActiveDescriptorSet{pool, &layoutSlots.emplace_back(set.value)};
+                auto &slot{layoutSlots.emplace_back(set.value)};
+                slot.active.test_and_set(std::memory_order_release);
+                return ActiveDescriptorSet{pool, &slot};
             } else {
                 lastResult = set.result;
             }
@@ -135,7 +142,9 @@ namespace skyline::gpu {
             auto set{AllocateVkDescriptorSet(layout)};
             if (set.result == vk::Result::eSuccess) {
                 auto &layoutSlots{pool->layoutSlots.try_emplace(layout).first->second};
-                return ActiveDescriptorSet{pool, &layoutSlots.emplace_back(set.value)};
+                auto &slot{layoutSlots.emplace_back(set.value)};
+                slot.active.test_and_set(std::memory_order_release);
+                return ActiveDescriptorSet{pool, &slot};
             } else {
                 lastResult = set.result;
             }

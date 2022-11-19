@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <range/v3/view.hpp>
+#include <range/v3/algorithm.hpp>
+#include <common/spin_lock.h>
 #include <common/lockable_shared_ptr.h>
 #include <nce.h>
 #include <gpu/tag_allocator.h>
@@ -10,6 +13,12 @@
 
 namespace skyline::gpu {
     namespace texture {
+        enum class RenderPassUsage : u8 {
+            None,
+            Sampled,
+            RenderTarget
+        };
+
         struct Dimensions {
             u32 width;
             u32 height;
@@ -110,7 +119,12 @@ namespace skyline::gpu {
              * @return If the supplied format is texel-layout compatible with the current format
              */
             constexpr bool IsCompatible(const FormatBase &other) const {
-                return bpb == other.bpb && blockHeight == other.blockHeight && blockWidth == other.blockWidth;
+                return vkFormat == other.vkFormat
+                    || (vkFormat == vk::Format::eD32Sfloat && other.vkFormat == vk::Format::eR32Sfloat)
+                    || (componentCount(vkFormat) == componentCount(other.vkFormat) &&
+                        ranges::all_of(ranges::views::iota(u8{0}, componentCount(vkFormat)), [this, other](auto i) {
+                            return componentBits(vkFormat, i) == componentBits(other.vkFormat, i);
+                        }) && (vkAspect & other.vkAspect) != vk::ImageAspectFlags{});
             }
 
             /**
@@ -276,6 +290,11 @@ namespace skyline::gpu {
         u32 GetLayerStride();
 
         /**
+         * @brief Calculates the size of a single layer in bytes, unlike `GetLayerStride` the returned layer size is always calculated and may not be equal to the actual layer stride
+         */
+        u32 CalculateLayerSize() const;
+
+        /**
          * @return The most appropriate backing image type for this texture
          */
         vk::ImageType GetImageType() const;
@@ -285,6 +304,8 @@ namespace skyline::gpu {
         u32 GetViewDepth() const;
 
         size_t GetSize();
+
+        bool MappingsValid() const;
     };
 
     class TextureManager;
@@ -354,9 +375,9 @@ namespace skyline::gpu {
     class Texture : public std::enable_shared_from_this<Texture> {
       private:
         GPU &gpu;
-        std::mutex mutex; //!< Synchronizes any mutations to the texture or its backing
+        RecursiveSpinLock mutex; //!< Synchronizes any mutations to the texture or its backing
         std::atomic<ContextTag> tag{}; //!< The tag associated with the last lock call
-        std::condition_variable backingCondition; //!< Signalled when a valid backing has been swapped in
+        std::condition_variable_any backingCondition; //!< Signalled when a valid backing has been swapped in
         using BackingType = std::variant<vk::Image, vk::raii::Image, memory::Image>;
         BackingType backing; //!< The Vulkan image that backs this texture, it is nullable
 
@@ -384,6 +405,9 @@ namespace skyline::gpu {
         };
 
         std::vector<TextureViewStorage> views;
+
+        u32 lastRenderPassIndex{}; //!< The index of the last render pass that used this texture
+        texture::RenderPassUsage lastRenderPassUsage{texture::RenderPassUsage::None}; //!< The type of usage in the last render pass
 
         friend TextureManager;
         friend TextureView;
@@ -420,6 +444,14 @@ namespace skyline::gpu {
          * @return A vector of all the buffer image copies that need to be done for every aspect of every level of every layer of the texture
          */
         boost::container::small_vector<vk::BufferImageCopy, 10> GetBufferImageCopies();
+
+        static constexpr size_t FrequentlyLockedThreshold{2}; //!< Threshold for the number of times a texture can be locked (not from context locks, only normal) before it should be considered frequently locked
+        size_t accumulatedCpuLockCounter{};
+
+        static constexpr size_t SkipReadbackHackWaitCountThreshold{8}; //!< Threshold for the number of times a texture can be waited on before it should be considered for the readback hack
+        static constexpr std::chrono::nanoseconds SkipReadbackHackWaitTimeThreshold{constant::NsInSecond / 2}; //!< Threshold for the amount of time a texture can be waited on before it should be considered for the readback hack, `SkipReadbackHackWaitCountThreshold` needs to be hit before this
+        size_t accumulatedGuestWaitCounter{}; //!< Total number of times the texture has been waited on
+        std::chrono::nanoseconds accumulatedGuestWaitTime{}; //!< Amount of time the texture has been waited on for since the `SkipReadbackHackWaitCountThreshold`th wait on it by the guest
 
       public:
         std::shared_ptr<FenceCycle> cycle; //!< A fence cycle for when any host operation mutating the texture has completed, it must be waited on prior to any mutations to the backing
@@ -548,10 +580,28 @@ namespace skyline::gpu {
         /**
          * @brief Copies the contents of the supplied source texture into the current texture
          */
-        void CopyFrom(std::shared_ptr<Texture> source, const vk::ImageSubresourceRange &subresource = vk::ImageSubresourceRange{
+        void CopyFrom(std::shared_ptr<Texture> source, vk::Semaphore waitSemaphore, vk::Semaphore signalSemaphore, const vk::ImageSubresourceRange &subresource = vk::ImageSubresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .levelCount = VK_REMAINING_MIP_LEVELS,
             .layerCount = VK_REMAINING_ARRAY_LAYERS,
         });
+
+        /**
+         * @return If the texture is frequently locked by threads using non-ContextLocks
+         */
+        bool FrequentlyLocked() {
+            return accumulatedCpuLockCounter >= FrequentlyLockedThreshold;
+        }
+
+        /**
+         * @brief Checks if the previous usage in the renderpass is compatible with the current one
+         * @return If the new usage is compatible with the previous usage
+         */
+        bool ValidateRenderPassUsage(u32 renderPassIndex, texture::RenderPassUsage renderPassUsage);
+
+        /**
+         * @brief Updates renderpass usage tracking information
+         */
+        void UpdateRenderPassUsage(u32 renderPassIndex, texture::RenderPassUsage renderPassUsage);
     };
 }

@@ -29,7 +29,7 @@ namespace skyline::loader {
         return outputBuffer;
     }
 
-    Loader::ExecutableLoadInfo NsoLoader::LoadNso(Loader *loader, const std::shared_ptr<vfs::Backing> &backing, const std::shared_ptr<kernel::type::KProcess> &process, const DeviceState &state, size_t offset, const std::string &name) {
+    Loader::ExecutableLoadInfo NsoLoader::LoadNso(Loader *loader, const std::shared_ptr<vfs::Backing> &backing, const std::shared_ptr<kernel::type::KProcess> &process, const DeviceState &state, size_t offset, const std::string &name, bool dynamicallyLinked) {
         auto header{backing->Read<NsoHeader>()};
 
         if (header.magic != util::MakeMagic<u32>("NSO0"))
@@ -38,25 +38,25 @@ namespace skyline::loader {
         Executable executable{};
 
         executable.text.contents = GetSegment(backing, header.text, header.flags.textCompressed ? header.textCompressedSize : 0);
-        executable.text.contents.resize(util::AlignUp(executable.text.contents.size(), PAGE_SIZE));
+        executable.text.contents.resize(util::AlignUp(executable.text.contents.size(), constant::PageSize));
         executable.text.offset = header.text.memoryOffset;
 
         executable.ro.contents = GetSegment(backing, header.ro, header.flags.roCompressed ? header.roCompressedSize : 0);
-        executable.ro.contents.resize(util::AlignUp(executable.ro.contents.size(), PAGE_SIZE));
+        executable.ro.contents.resize(util::AlignUp(executable.ro.contents.size(), constant::PageSize));
         executable.ro.offset = header.ro.memoryOffset;
 
         executable.data.contents = GetSegment(backing, header.data, header.flags.dataCompressed ? header.dataCompressedSize : 0);
         executable.data.offset = header.data.memoryOffset;
 
         // Data and BSS are aligned together
-        executable.bssSize = util::AlignUp(executable.data.contents.size() + header.bssSize, PAGE_SIZE) - executable.data.contents.size();
+        executable.bssSize = util::AlignUp(executable.data.contents.size() + header.bssSize, constant::PageSize) - executable.data.contents.size();
 
         if (header.dynsym.offset + header.dynsym.size <= header.ro.decompressedSize && header.dynstr.offset + header.dynstr.size <= header.ro.decompressedSize) {
             executable.dynsym = {header.dynsym.offset, header.dynsym.size};
             executable.dynstr = {header.dynstr.offset, header.dynstr.size};
         }
 
-        return loader->LoadExecutable(process, state, executable, offset, name);
+        return loader->LoadExecutable(process, state, executable, offset, name, dynamicallyLinked);
     }
 
     void *NsoLoader::LoadProcessData(const std::shared_ptr<kernel::type::KProcess> &process, const DeviceState &state) {

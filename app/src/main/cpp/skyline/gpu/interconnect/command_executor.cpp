@@ -1,35 +1,178 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright © 2021 Skyline Team and Contributors (https://github.com/skyline-emu/)
 
+#include <range/v3/view.hpp>
+#include <common/settings.h>
+#include <loader/loader.h>
 #include <gpu.h>
+#include <dlfcn.h>
 #include "command_executor.h"
 
 namespace skyline::gpu::interconnect {
-    CommandExecutor::CommandExecutor(const DeviceState &state) : gpu{*state.gpu}, activeCommandBuffer{gpu.scheduler.AllocateCommandBuffer()}, cycle{activeCommandBuffer.GetFenceCycle()}, tag{AllocateTag()} {}
+    CommandRecordThread::CommandRecordThread(const DeviceState &state)
+        : state{state},
+          incoming{*state.settings->executorSlotCount},
+          outgoing{*state.settings->executorSlotCount},
+          thread{&CommandRecordThread::Run, this} {}
+
+    static vk::raii::CommandBuffer AllocateRaiiCommandBuffer(GPU &gpu, vk::raii::CommandPool &pool) {
+        return {gpu.vkDevice, (*gpu.vkDevice).allocateCommandBuffers(
+                    {
+                        .commandPool = *pool,
+                        .level = vk::CommandBufferLevel::ePrimary,
+                        .commandBufferCount = 1
+                    }, *gpu.vkDevice.getDispatcher()).front(),
+                *pool};
+    }
+
+    CommandRecordThread::Slot::Slot(GPU &gpu)
+        : commandPool{gpu.vkDevice,
+                      vk::CommandPoolCreateInfo{
+                          .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
+                          .queueFamilyIndex = gpu.vkQueueFamilyIndex
+                      }
+          },
+          commandBuffer{AllocateRaiiCommandBuffer(gpu, commandPool)},
+          fence{gpu.vkDevice, vk::FenceCreateInfo{ .flags = vk::FenceCreateFlagBits::eSignaled }},
+          semaphore{gpu.vkDevice, vk::SemaphoreCreateInfo{}},
+          cycle{std::make_shared<FenceCycle>(gpu.vkDevice, *fence, *semaphore, true)} {}
+
+    CommandRecordThread::Slot::Slot(Slot &&other)
+        : commandPool{std::move(other.commandPool)},
+          commandBuffer{std::move(other.commandBuffer)},
+          fence{std::move(other.fence)},
+          semaphore{std::move(other.semaphore)},
+          cycle{std::move(other.cycle)} {}
+
+    std::shared_ptr<FenceCycle> CommandRecordThread::Slot::Reset(GPU &gpu) {
+        cycle->Wait();
+        cycle = std::make_shared<FenceCycle>(*cycle);
+        // Command buffer doesn't need to be reset since that's done implicitly by begin
+        return cycle;
+    }
+
+    void CommandRecordThread::ProcessSlot(Slot *slot) {
+        TRACE_EVENT_FMT("gpu", "ProcessSlot: 0x{:X}, execution: {}", slot, slot->executionNumber);
+        auto &gpu{*state.gpu};
+
+        vk::RenderPass lRenderPass;
+        u32 subpassIndex;
+
+        std::scoped_lock bufferLock{gpu.buffer.recreationMutex};
+        using namespace node;
+        for (NodeVariant &node : slot->nodes) {
+            #define NODE(name) [&](name& node) { node(slot->commandBuffer, slot->cycle, gpu); }
+            std::visit(VariantVisitor{
+                NODE(FunctionNode),
+
+                [&](RenderPassNode &node) {
+                    lRenderPass = node(slot->commandBuffer, slot->cycle, gpu);
+                    subpassIndex = 0;
+                },
+
+                [&](NextSubpassNode &node) {
+                    node(slot->commandBuffer, slot->cycle, gpu);
+                    ++subpassIndex;
+                },
+                [&](SubpassFunctionNode &node) { node(slot->commandBuffer, slot->cycle, gpu, lRenderPass, subpassIndex); },
+                [&](NextSubpassFunctionNode &node) { node(slot->commandBuffer, slot->cycle, gpu, lRenderPass, ++subpassIndex); },
+
+                NODE(RenderPassEndNode),
+            }, node);
+            #undef NODE
+        }
+
+        slot->commandBuffer.end();
+
+        gpu.scheduler.SubmitCommandBuffer(slot->commandBuffer, slot->cycle);
+
+        slot->nodes.clear();
+        slot->allocator.Reset();
+    }
+
+    void CommandRecordThread::Run() {
+        auto &gpu{*state.gpu};
+
+        RENDERDOC_API_1_4_2 *renderDocApi{};
+        if (void *mod{dlopen("libVkLayer_GLES_RenderDoc.so", RTLD_NOW | RTLD_NOLOAD)}) {
+            auto *pfnGetApi{reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"))};
+            if (int ret{pfnGetApi(eRENDERDOC_API_Version_1_4_2, (void **)&renderDocApi)}; ret != 1)
+                Logger::Warn("Failed to intialise RenderDoc API: {}", ret);
+        }
+
+        std::vector<Slot> slots{};
+        std::generate_n(std::back_inserter(slots), *state.settings->executorSlotCount, [&] () -> Slot { return gpu; });
+
+        outgoing.AppendTranform(span<Slot>(slots), [](auto &slot) { return &slot; });
+
+        if (int result{pthread_setname_np(pthread_self(), "Sky-CmdRecord")})
+            Logger::Warn("Failed to set the thread name: {}", strerror(result));
+
+        try {
+            signal::SetSignalHandler({SIGINT, SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV}, signal::ExceptionalSignalHandler);
+
+            incoming.Process([this, renderDocApi, &gpu](Slot *slot) {
+                VkInstance instance{*gpu.vkInstance};
+                if (renderDocApi && slot->capture)
+                    renderDocApi->StartFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), nullptr);
+
+                ProcessSlot(slot);
+
+                if (renderDocApi && slot->capture)
+                    renderDocApi->EndFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), nullptr);
+                slot->capture = false;
+
+                outgoing.Push(slot);
+            }, [] {});
+        } catch (const signal::SignalException &e) {
+            Logger::Error("{}\nStack Trace:{}", e.what(), state.loader->GetStackTrace(e.frames));
+            if (state.process)
+                state.process->Kill(false);
+            else
+                std::rethrow_exception(std::current_exception());
+        } catch (const std::exception &e) {
+            Logger::Error(e.what());
+            if (state.process)
+                state.process->Kill(false);
+            else
+                std::rethrow_exception(std::current_exception());
+        }
+    }
+
+    CommandRecordThread::Slot *CommandRecordThread::AcquireSlot() {
+        return outgoing.Pop();
+    }
+
+    void CommandRecordThread::ReleaseSlot(Slot *slot) {
+        incoming.Push(slot);
+    }
+
+    CommandExecutor::CommandExecutor(const DeviceState &state)
+        : state{state},
+          gpu{*state.gpu},
+          recordThread{state},
+          tag{AllocateTag()} {
+        RotateRecordSlot();
+    }
 
     CommandExecutor::~CommandExecutor() {
         cycle->Cancel();
     }
 
-    TextureManager &CommandExecutor::AcquireTextureManager() {
-        if (!textureManagerLock)
-            textureManagerLock.emplace(gpu.texture);
-        return gpu.texture;
+    void CommandExecutor::RotateRecordSlot() {
+        if (slot) {
+            slot->capture = captureNextExecution;
+            recordThread.ReleaseSlot(slot);
+        }
+
+        captureNextExecution = false;
+        slot = recordThread.AcquireSlot();
+        cycle = slot->Reset(gpu);
+        slot->executionNumber = executionNumber;
+        allocator = &slot->allocator;
     }
 
-    BufferManager &CommandExecutor::AcquireBufferManager() {
-        if (!bufferManagerLock)
-            bufferManagerLock.emplace(gpu.buffer);
-        return gpu.buffer;
-    }
-
-    MegaBufferAllocator &CommandExecutor::AcquireMegaBufferAllocator() {
-        if (!megaBufferAllocatorLock)
-            megaBufferAllocatorLock.emplace(gpu.megaBufferAllocator);
-        return gpu.megaBufferAllocator;
-    }
-
-    bool CommandExecutor::CreateRenderPassWithSubpass(vk::Rect2D renderArea, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment) {
+    bool CommandExecutor::CreateRenderPassWithSubpass(vk::Rect2D renderArea, span<TextureView *> sampledImages, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment, bool noSubpassCreation) {
         auto addSubpass{[&] {
             renderPass->AddSubpass(inputAttachments, colorAttachments, depthStencilAttachment, gpu);
 
@@ -52,32 +195,48 @@ namespace skyline::gpu::interconnect {
             lastSubpassDepthStencilAttachment = depthStencilAttachment;
         }};
 
-        if (renderPass == nullptr || renderPass->renderArea != renderArea || subpassCount >= gpu.traits.quirks.maxSubpassCount) {
+        span<TextureView *> depthStencilAttachmentSpan{depthStencilAttachment ? span<TextureView *>(depthStencilAttachment) : span<TextureView *>()};
+        auto outputAttachmentViews{ranges::views::concat(colorAttachments, depthStencilAttachmentSpan)};
+        bool attachmentsMatch{ranges::equal(lastSubpassInputAttachments, inputAttachments) &&
+                              ranges::equal(lastSubpassColorAttachments, colorAttachments) &&
+                              lastSubpassDepthStencilAttachment == depthStencilAttachment};
+
+        bool splitRenderPass{renderPass == nullptr || renderPass->renderArea != renderArea ||
+            ((noSubpassCreation || subpassCount >= gpu.traits.quirks.maxSubpassCount) && !attachmentsMatch) ||
+            !ranges::all_of(outputAttachmentViews, [this] (auto view) { return !view || view->texture->ValidateRenderPassUsage(renderPassIndex, texture::RenderPassUsage::RenderTarget); }) ||
+            !ranges::all_of(sampledImages, [this] (auto view) { return view->texture->ValidateRenderPassUsage(renderPassIndex, texture::RenderPassUsage::Sampled); })};
+
+        bool gotoNext{};
+        if (splitRenderPass) {
             // We need to create a render pass if one doesn't already exist or the current one isn't compatible
-            if (renderPass != nullptr)
-                nodes.emplace_back(std::in_place_type_t<node::RenderPassEndNode>());
-            renderPass = &std::get<node::RenderPassNode>(nodes.emplace_back(std::in_place_type_t<node::RenderPassNode>(), renderArea));
+            if (renderPass != nullptr) {
+                slot->nodes.emplace_back(std::in_place_type_t<node::RenderPassEndNode>());
+                renderPassIndex++;
+            }
+            renderPass = &std::get<node::RenderPassNode>(slot->nodes.emplace_back(std::in_place_type_t<node::RenderPassNode>(), renderArea));
             addSubpass();
             subpassCount = 1;
-            return false;
-        } else {
-            if (ranges::equal(lastSubpassInputAttachments, inputAttachments) &&
-                ranges::equal(lastSubpassColorAttachments, colorAttachments) &&
-                lastSubpassDepthStencilAttachment == depthStencilAttachment) {
-                // The last subpass had the same attachments, so we can reuse them
-                return false;
-            } else {
-                // The last subpass had different attachments, so we need to create a new one
-                addSubpass();
-                subpassCount++;
-                return true;
-            }
+        } else if (!attachmentsMatch) {
+            // The last subpass had different attachments, so we need to create a new one
+            addSubpass();
+            subpassCount++;
+            gotoNext = true;
         }
+
+        for (auto view : outputAttachmentViews)
+            if (view)
+                view->texture->UpdateRenderPassUsage(renderPassIndex, texture::RenderPassUsage::RenderTarget);
+
+        for (auto view : sampledImages)
+            view->texture->UpdateRenderPassUsage(renderPassIndex, texture::RenderPassUsage::Sampled);
+
+        return gotoNext;
     }
 
     void CommandExecutor::FinishRenderPass() {
         if (renderPass) {
-            nodes.emplace_back(std::in_place_type_t<node::RenderPassEndNode>());
+            slot->nodes.emplace_back(std::in_place_type_t<node::RenderPassEndNode>());
+            renderPassIndex++;
 
             renderPass = nullptr;
             subpassCount = 0;
@@ -103,15 +262,15 @@ namespace skyline::gpu::interconnect {
     }
 
     bool CommandExecutor::AttachTexture(TextureView *view) {
-        if (!textureManagerLock)
-            // Avoids a potential deadlock with this resource being locked while acquiring the TextureManager lock while the thread owning it tries to acquire a lock on this texture
-            textureManagerLock.emplace(gpu.texture);
-
-        cycle->AttachObject(view->shared_from_this());
-
         bool didLock{view->LockWithTag(tag)};
-        if (didLock)
+        if (didLock) {
+            // TODO: fixup remaining bugs with this and add better heuristics to avoid pauses
+            // if (view->texture->FrequentlyLocked())
             attachedTextures.emplace_back(view->texture);
+            // else
+            //    preserveAttachedTextures.emplace_back(view->texture);
+        }
+
         return didLock;
     }
 
@@ -128,44 +287,33 @@ namespace skyline::gpu::interconnect {
             buffer->unlock();
     }
 
+    void CommandExecutor::AttachBufferBase(std::shared_ptr<Buffer> buffer) {
+        // TODO: fixup remaining bugs with this and add better heuristics to avoid pauses
+        // if (buffer->FrequentlyLocked())
+        attachedBuffers.emplace_back(std::move(buffer));
+        // else
+        //    preserveAttachedBuffers.emplace_back(std::move(buffer));
+    }
+
     bool CommandExecutor::AttachBuffer(BufferView &view) {
-        if (!bufferManagerLock)
-            // See AttachTexture(...)
-            bufferManagerLock.emplace(gpu.buffer);
-
-        bool didLock{view->LockWithTag(tag)};
+        bool didLock{view.LockWithTag(tag)};
         if (didLock)
-            attachedBuffers.emplace_back(view->buffer);
+            AttachBufferBase(view.GetBuffer()->shared_from_this());
 
-        if (view.bufferDelegate->attached)
-            return didLock;
-
-        attachedBufferDelegates.emplace_back(view.bufferDelegate);
-        view.bufferDelegate->attached = true;
         return didLock;
     }
 
     void CommandExecutor::AttachLockedBufferView(BufferView &view, ContextLock<BufferView> &&lock) {
-        if (!bufferManagerLock)
-            // See AttachTexture(...)
-            bufferManagerLock.emplace(gpu.buffer);
-
         if (lock.OwnsLock()) {
             // Transfer ownership to executor so that the resource will stay locked for the period it is used on the GPU
-            attachedBuffers.emplace_back(view->buffer);
+            AttachBufferBase(view.GetBuffer()->shared_from_this());
             lock.Release(); // The executor will handle unlocking the lock so it doesn't need to be handled here
         }
-
-        if (view.bufferDelegate->attached)
-            return;
-
-        attachedBufferDelegates.emplace_back(view.bufferDelegate);
-        view.bufferDelegate->attached = true;
     }
 
     void CommandExecutor::AttachLockedBuffer(std::shared_ptr<Buffer> buffer, ContextLock<Buffer> &&lock) {
         if (lock.OwnsLock()) {
-            attachedBuffers.emplace_back(std::move(buffer));
+            AttachBufferBase(std::move(buffer));
             lock.Release(); // See AttachLockedBufferView(...)
         }
     }
@@ -174,32 +322,26 @@ namespace skyline::gpu::interconnect {
         cycle->AttachObject(dependency);
     }
 
-    void CommandExecutor::AddSubpass(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32)> &&function, vk::Rect2D renderArea, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment, bool exclusiveSubpass) {
-        if (exclusiveSubpass)
-            FinishRenderPass();
-
-        bool gotoNext{CreateRenderPassWithSubpass(renderArea, inputAttachments, colorAttachments, depthStencilAttachment ? &*depthStencilAttachment : nullptr)};
+    void CommandExecutor::AddSubpass(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32)> &&function, vk::Rect2D renderArea, span<TextureView *> sampledImages, span<TextureView *> inputAttachments, span<TextureView *> colorAttachments, TextureView *depthStencilAttachment, bool noSubpassCreation) {
+        bool gotoNext{CreateRenderPassWithSubpass(renderArea, sampledImages, inputAttachments, colorAttachments, depthStencilAttachment ? &*depthStencilAttachment : nullptr, noSubpassCreation)};
         if (gotoNext)
-            nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), std::forward<decltype(function)>(function));
+            slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), std::forward<decltype(function)>(function));
         else
-            nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), std::forward<decltype(function)>(function));
-
-        if (exclusiveSubpass)
-            FinishRenderPass();
+            slot->nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), std::forward<decltype(function)>(function));
     }
 
     void CommandExecutor::AddOutsideRpCommand(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &)> &&function) {
         if (renderPass)
             FinishRenderPass();
 
-        nodes.emplace_back(std::in_place_type_t<node::FunctionNode>(), std::forward<decltype(function)>(function));
+        slot->nodes.emplace_back(std::in_place_type_t<node::FunctionNode>(), std::forward<decltype(function)>(function));
     }
 
     void CommandExecutor::AddClearColorSubpass(TextureView *attachment, const vk::ClearColorValue &value) {
-        bool gotoNext{CreateRenderPassWithSubpass(vk::Rect2D{.extent = attachment->texture->dimensions}, {}, attachment, nullptr)};
+        bool gotoNext{CreateRenderPassWithSubpass(vk::Rect2D{.extent = attachment->texture->dimensions}, {}, {}, attachment, nullptr)};
         if (renderPass->ClearColorAttachment(0, value, gpu)) {
             if (gotoNext)
-                nodes.emplace_back(std::in_place_type_t<node::NextSubpassNode>());
+                slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassNode>());
         } else {
             auto function{[scissor = attachment->texture->dimensions, value](vk::raii::CommandBuffer &commandBuffer, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32) {
                 commandBuffer.clearAttachments(vk::ClearAttachment{
@@ -214,17 +356,17 @@ namespace skyline::gpu::interconnect {
             }};
 
             if (gotoNext)
-                nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), function);
+                slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), function);
             else
-                nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), function);
+                slot->nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), function);
         }
     }
 
     void CommandExecutor::AddClearDepthStencilSubpass(TextureView *attachment, const vk::ClearDepthStencilValue &value) {
-        bool gotoNext{CreateRenderPassWithSubpass(vk::Rect2D{.extent = attachment->texture->dimensions}, {}, {}, attachment)};
+        bool gotoNext{CreateRenderPassWithSubpass(vk::Rect2D{.extent = attachment->texture->dimensions}, {}, {}, {}, attachment)};
         if (renderPass->ClearDepthStencilAttachment(value, gpu)) {
             if (gotoNext)
-                nodes.emplace_back(std::in_place_type_t<node::NextSubpassNode>());
+                slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassNode>());
         } else {
             auto function{[aspect = attachment->format->vkAspect, extent = attachment->texture->dimensions, value](vk::raii::CommandBuffer &commandBuffer, const std::shared_ptr<FenceCycle> &, GPU &, vk::RenderPass, u32) {
                 commandBuffer.clearAttachments(vk::ClearAttachment{
@@ -238,9 +380,9 @@ namespace skyline::gpu::interconnect {
             }};
 
             if (gotoNext)
-                nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), function);
+                slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), function);
             else
-                nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), function);
+                slot->nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), function);
         }
     }
 
@@ -248,116 +390,107 @@ namespace skyline::gpu::interconnect {
         flushCallbacks.emplace_back(std::forward<decltype(callback)>(callback));
     }
 
+    void CommandExecutor::AddPipelineChangeCallback(std::function<void()> &&callback) {
+        pipelineChangeCallbacks.emplace_back(std::forward<decltype(callback)>(callback));
+    }
+
+    void CommandExecutor::NotifyPipelineChange() {
+        for (auto &callback : pipelineChangeCallbacks)
+            callback();
+    }
+
     void CommandExecutor::SubmitInternal() {
         if (renderPass)
             FinishRenderPass();
 
         {
-            auto &commandBuffer{*activeCommandBuffer};
-            commandBuffer.begin(vk::CommandBufferBeginInfo{
+            slot->commandBuffer.begin(vk::CommandBufferBeginInfo{
                 .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
             });
 
             // We need this barrier here to ensure that resources are in the state we expect them to be in, we shouldn't overwrite resources while prior commands might still be using them or read from them while they might be modified by prior commands
-            commandBuffer.pipelineBarrier(
+            slot->commandBuffer.pipelineBarrier(
                 vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {}, vk::MemoryBarrier{
                     .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
                     .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
                 }, {}, {}
             );
 
-            for (const auto &texture : attachedTextures)
-                texture->SynchronizeHostInline(commandBuffer, cycle, true);
-
-            vk::RenderPass lRenderPass;
-            u32 subpassIndex;
-
-            using namespace node;
-            for (NodeVariant &node : nodes) {
-                #define NODE(name) [&](name& node) { node(commandBuffer, cycle, gpu); }
-                std::visit(VariantVisitor{
-                    NODE(FunctionNode),
-
-                    [&](RenderPassNode &node) {
-                        lRenderPass = node(commandBuffer, cycle, gpu);
-                        subpassIndex = 0;
-                    },
-
-                    [&](NextSubpassNode &node) {
-                        node(commandBuffer, cycle, gpu);
-                        ++subpassIndex;
-                    },
-                    [&](SubpassFunctionNode &node) { node(commandBuffer, cycle, gpu, lRenderPass, subpassIndex); },
-                    [&](NextSubpassFunctionNode &node) { node(commandBuffer, cycle, gpu, lRenderPass, ++subpassIndex); },
-
-                    NODE(RenderPassEndNode),
-                }, node);
-                #undef NODE
-            }
-
-            commandBuffer.end();
-
-            for (const auto &attachedBuffer : attachedBuffers)
-                attachedBuffer->SynchronizeHost(); // Synchronize attached buffers from the CPU without using a staging buffer, this is done directly prior to submission to prevent stalls
-
-            gpu.scheduler.SubmitCommandBuffer(commandBuffer, cycle);
-
-            nodes.clear();
-
-            for (const auto &attachedTexture : attachedTextures) {
+            boost::container::small_vector<FenceCycle *, 8> chainedCycles;
+            for (const auto &texture : ranges::views::concat(attachedTextures, preserveAttachedTextures)) {
+                texture->SynchronizeHostInline(slot->commandBuffer, cycle, true);
                 // We don't need to attach the Texture to the cycle as a TextureView will already be attached
-                cycle->ChainCycle(attachedTexture->cycle);
-                attachedTexture->cycle = cycle;
-            }
-
-            for (const auto &attachedBuffer : attachedBuffers) {
-                if (attachedBuffer->RequiresCycleAttach() ) {
-                    cycle->AttachObject(attachedBuffer.buffer);
-                    attachedBuffer->UpdateCycle(cycle);
+                if (ranges::find(chainedCycles, texture->cycle.get()) == chainedCycles.end()) {
+                    cycle->ChainCycle(texture->cycle);
+                    chainedCycles.emplace_back(texture->cycle.get());
                 }
+
+                texture->cycle = cycle;
+                texture->UpdateRenderPassUsage(0, texture::RenderPassUsage::None);
             }
         }
+
+        for (const auto &attachedBuffer : ranges::views::concat(attachedBuffers, preserveAttachedBuffers)) {
+            if (attachedBuffer->RequiresCycleAttach()) {
+                attachedBuffer->SynchronizeHost(); // Synchronize attached buffers from the CPU without using a staging buffer
+                cycle->AttachObject(attachedBuffer.buffer);
+                attachedBuffer->UpdateCycle(cycle);
+                attachedBuffer->AllowAllBackingWrites();
+            }
+        }
+
+        RotateRecordSlot();
     }
 
     void CommandExecutor::ResetInternal() {
         attachedTextures.clear();
-        textureManagerLock.reset();
-
-        for (const auto &delegate : attachedBufferDelegates) {
-            delegate->usageCallbacks.reset();
-            delegate->attached = false;
-            delegate->view->megaBufferAllocation = {};
-        }
-
-        attachedBufferDelegates.clear();
         attachedBuffers.clear();
-        bufferManagerLock.reset();
-        megaBufferAllocatorLock.reset();
-        allocator.Reset();
+        allocator->Reset();
+        renderPassIndex = 0;
+
+        // Periodically clear preserve attachments just in case there are new waiters which would otherwise end up waiting forever
+        if ((submissionNumber % (*state.settings->executorSlotCount * 2)) == 0) {
+            preserveAttachedBuffers.clear();
+            preserveAttachedTextures.clear();
+        }
     }
 
     void CommandExecutor::Submit() {
         for (const auto &callback : flushCallbacks)
             callback();
 
-        if (!nodes.empty()) {
+        executionNumber++;
+
+        if (!slot->nodes.empty()) {
             TRACE_EVENT("gpu", "CommandExecutor::Submit");
             SubmitInternal();
-            activeCommandBuffer = gpu.scheduler.AllocateCommandBuffer();
-            cycle = activeCommandBuffer.GetFenceCycle();
+            submissionNumber++;
         }
+
         ResetInternal();
     }
 
-    void CommandExecutor::SubmitWithFlush() {
-        for (const auto &callback : flushCallbacks)
-            callback();
+    void CommandExecutor::LockPreserve() {
+        if (!preserveLocked) {
+            preserveLocked = true;
 
-        if (!nodes.empty()) {
-            TRACE_EVENT("gpu", "CommandExecutor::SubmitWithFlush");
-            SubmitInternal();
-            cycle = activeCommandBuffer.Reset();
+            for (auto &buffer : preserveAttachedBuffers)
+                buffer->LockWithTag(tag);
+
+            for (auto &texture : preserveAttachedTextures)
+                texture->LockWithTag(tag);
         }
-        ResetInternal();
+    }
+
+    void CommandExecutor::UnlockPreserve() {
+        if (preserveLocked) {
+            for (auto &buffer : preserveAttachedBuffers)
+                buffer->unlock();
+
+            for (auto &texture : preserveAttachedTextures)
+                texture->unlock();
+
+            preserveLocked = false;
+        }
     }
 }

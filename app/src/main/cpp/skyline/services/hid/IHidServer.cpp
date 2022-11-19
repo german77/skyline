@@ -41,6 +41,11 @@ namespace skyline::service::hid {
         return {};
     }
 
+    Result IHidServer::IsSixAxisSensorAtRest(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        response.Push<u8>(1);
+        return {};
+    }
+
     Result IHidServer::SetSupportedNpadStyleSet(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         auto styleSet{request.Pop<NpadStyleSet>()};
         std::scoped_lock lock{state.input->npad.mutex};
@@ -78,6 +83,8 @@ namespace skyline::service::hid {
     Result IHidServer::AcquireNpadStyleSetUpdateEventHandle(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         auto id{request.Pop<NpadId>()};
         auto handle{state.process->InsertItem(state.input->npad.at(id).updateEvent)};
+
+        state.input->npad.at(id).updateEvent->Signal();
 
         Logger::Debug("Npad {} Style Set Update Event Handle: 0x{:X}", id, handle);
         response.copyHandles.push_back(handle);
@@ -244,6 +251,10 @@ namespace skyline::service::hid {
             }
         }
 
+        return {};
+    }
+
+    Result IHidServer::SetPalmaBoostMode(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         return {};
     }
 }
