@@ -470,6 +470,7 @@ namespace skyline::gpu {
         size_t deswizzledSurfaceSize{}; //!< The size of the guest surface with linear tiling, calculated with the guest format which may differ from the host format
         size_t surfaceSize{}; //!< The size of the entire surface given linear tiling, this contains all mip levels and layers
         vk::SampleCountFlagBits sampleCount;
+        bool replaced{};
 
         /**
          * @brief Creates a texture object wrapping the supplied backing with the supplied attributes
@@ -580,7 +581,7 @@ namespace skyline::gpu {
         /**
          * @brief Copies the contents of the supplied source texture into the current texture
          */
-        void CopyFrom(std::shared_ptr<Texture> source, vk::Semaphore waitSemaphore, vk::Semaphore signalSemaphore, const vk::ImageSubresourceRange &subresource = vk::ImageSubresourceRange{
+        void CopyFrom(std::shared_ptr<Texture> source, vk::Semaphore waitSemaphore, vk::Semaphore signalSemaphore, texture::Format srcFormat, const vk::ImageSubresourceRange &subresource = vk::ImageSubresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .levelCount = VK_REMAINING_MIP_LEVELS,
             .layerCount = VK_REMAINING_ARRAY_LAYERS,

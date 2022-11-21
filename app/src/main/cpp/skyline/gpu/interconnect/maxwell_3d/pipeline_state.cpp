@@ -213,7 +213,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         bool thirdDimensionDefinesArraySize{engine->ztSize.control == engine::ZtSize::Control::ThirdDimensionDefinesArraySize};
         if (engine->ztSize.control == engine::ZtSize::Control::ThirdDimensionDefinesArraySize) {
             guest.layerCount = engine->ztSize.thirdDimension;
-            guest.viewType = vk::ImageViewType::e2DArray;
+            guest.viewType = engine->ztSize.thirdDimension > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
         } else if (engine->ztSize.control == engine::ZtSize::Control::ArraySizeIsOne) {
             guest.layerCount = 1;
             guest.viewType = vk::ImageViewType::e2D;
@@ -261,6 +261,9 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         auto[blockMapping, blockOffset]{ctx.channelCtx.asCtx->gmmu.LookupBlock(engine->programRegion + engine->pipeline.programOffset)};
 
+        if (!trapExecutionLock)
+            trapExecutionLock.emplace(trapMutex);
+
         // Skip looking up the mirror if it is the same as the one used for the previous update
         if (!mirrorBlock.valid() || !mirrorBlock.contains(blockMapping)) {
             auto mirrorIt{mirrorMap.find(blockMapping.data())};
@@ -272,11 +275,13 @@ namespace skyline::gpu::interconnect::maxwell3d {
                 auto trapHandle{ctx.nce.CreateTrap(blockMapping, [mutex = &trapMutex]() {
                     std::scoped_lock lock{*mutex};
                     return;
-                }, []() { return true; }, [dirty = &newIt.first->second->dirty, mutex = &trapMutex]() {
+                }, []() { return true; }, [entry = newIt.first->second.get(), mutex = &trapMutex]() {
                     std::unique_lock lock{*mutex, std::try_to_lock};
                     if (!lock)
                         return false;
-                    *dirty = true;
+
+                    if (++entry->trapCount <= MirrorEntry::SkipTrapThreshold)
+                        entry->dirty = true;
                     return true;
                 })};
 
@@ -292,14 +297,18 @@ namespace skyline::gpu::interconnect::maxwell3d {
             mirrorBlock = blockMapping;
         }
 
-        if (!trapExecutionLock)
-            trapExecutionLock.emplace(trapMutex);
+        if (entry->trapCount > MirrorEntry::SkipTrapThreshold && entry->channelSequenceNumber != ctx.channelCtx.channelSequenceNumber) {
+            entry->channelSequenceNumber = ctx.channelCtx.channelSequenceNumber;
+            entry->dirty = true;
+        }
 
         // If the mirror entry has been written to, clear its shader binary cache and retrap to catch any future writes
         if (entry->dirty) {
             entry->cache.clear();
             entry->dirty = false;
-            ctx.nce.TrapRegions(*entry->trap, true);
+
+            if (entry->trapCount <= MirrorEntry::SkipTrapThreshold)
+                ctx.nce.TrapRegions(*entry->trap, true);
         } else if (auto it{entry->cache.find(blockMapping.data() + blockOffset)}; it != entry->cache.end()) {
             binary = it->second.binary;
             hash = it->second.hash;
@@ -336,7 +345,9 @@ namespace skyline::gpu::interconnect::maxwell3d {
         if (!trapExecutionLock)
             trapExecutionLock.emplace(trapMutex);
 
-        if (entry && entry->dirty)
+        if (entry && entry->trapCount > MirrorEntry::SkipTrapThreshold && entry->channelSequenceNumber != ctx.channelCtx.channelSequenceNumber)
+            return true;
+        else if (entry && entry->dirty)
             return true;
 
         return false;

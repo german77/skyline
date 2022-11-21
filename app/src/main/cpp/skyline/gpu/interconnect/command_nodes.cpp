@@ -31,7 +31,7 @@ namespace skyline::gpu::interconnect::node {
                     .usage = view->texture->usage,
                     .width = view->texture->dimensions.width,
                     .height = view->texture->dimensions.height,
-                    .layerCount = view->texture->layerCount,
+                    .layerCount = view->range.layerCount,
                     .viewFormatCount = 1,
                     .pViewFormats = &view->format->vkFormat,
                 });
@@ -102,11 +102,11 @@ namespace skyline::gpu::interconnect::node {
             if (view->format->vkAspect & vk::ImageAspectFlagBits::eColor) {
                 dependency.srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
                 dependency.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
-                dependency.dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead;
+                dependency.dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite;
             } else if (view->format->vkAspect & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) {
                 dependency.srcStageMask = vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests;
                 dependency.srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite;
-                dependency.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead;
+                dependency.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead | vk::AccessFlagBits::eDepthStencilAttachmentWrite;
             }
 
             if (std::find(subpassDependencies.begin(), subpassDependencies.end(), dependency) == subpassDependencies.end())
