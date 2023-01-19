@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <future>
+#include <BS_thread_pool.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 namespace skyline::gpu {
@@ -31,8 +33,9 @@ namespace skyline::gpu::cache {
             const vk::PipelineColorBlendStateCreateInfo &colorBlendState;
             const vk::PipelineDynamicStateCreateInfo &dynamicState;
 
-            span<TextureView *> colorAttachments; //!< All color attachments in the subpass of this pipeline
-            TextureView *depthStencilAttachment; //!< A nullable pointer to the depth/stencil attachment in the subpass of this pipeline
+            span<vk::Format> colorFormats; //!< All color attachment formats in the subpass of this pipeline
+            vk::Format depthStencilFormat; //!< The depth attachment format in the subpass of this pipeline, 'Undefined' if there is no depth attachment
+            vk::SampleCountFlagBits sampleCount; //!< The sample count of the subpass of this pipeline
 
             constexpr const vk::PipelineVertexInputStateCreateInfo &VertexInputState() const {
                 return vertexState.get<vk::PipelineVertexInputStateCreateInfo>();
@@ -63,9 +66,8 @@ namespace skyline::gpu::cache {
          */
         struct AttachmentMetadata {
             vk::Format format;
-            vk::SampleCountFlagBits sampleCount;
 
-            constexpr AttachmentMetadata(vk::Format format, vk::SampleCountFlagBits sampleCount) : format(format), sampleCount(sampleCount) {}
+            constexpr AttachmentMetadata(vk::Format format, vk::SampleCountFlagBits sampleCount) : format(format) {}
 
             bool operator==(const AttachmentMetadata &rhs) const = default;
         };
@@ -88,11 +90,13 @@ namespace skyline::gpu::cache {
             vk::PipelineMultisampleStateCreateInfo multisampleState;
             vk::PipelineDepthStencilStateCreateInfo depthStencilState;
             vk::PipelineColorBlendStateCreateInfo colorBlendState;
+            std::vector<vk::DynamicState> dynamicStates;
             vk::PipelineDynamicStateCreateInfo dynamicState;
             std::vector<vk::PipelineColorBlendAttachmentState> colorBlendAttachments;
 
-            std::vector<AttachmentMetadata> colorAttachments;
-            std::optional<AttachmentMetadata> depthStencilAttachment;
+            std::vector<vk::Format> colorFormats;
+            vk::Format depthStencilFormat;
+            vk::SampleCountFlagBits sampleCount;
 
             PipelineCacheKey(const PipelineState& state);
 
@@ -134,12 +138,15 @@ namespace skyline::gpu::cache {
         struct PipelineCacheEntry {
             vk::raii::DescriptorSetLayout descriptorSetLayout;
             vk::raii::PipelineLayout pipelineLayout;
-            vk::raii::Pipeline pipeline;
+            std::optional<std::shared_future<vk::raii::Pipeline>> pipeline;
 
-            PipelineCacheEntry(vk::raii::DescriptorSetLayout&& descriptorSetLayout, vk::raii::PipelineLayout &&layout, vk::raii::Pipeline &&pipeline);
+            PipelineCacheEntry(vk::raii::DescriptorSetLayout&& descriptorSetLayout, vk::raii::PipelineLayout &&layout);
         };
 
+        BS::thread_pool pool;
         std::unordered_map<PipelineCacheKey, PipelineCacheEntry, PipelineStateHash, PipelineCacheEqual> pipelineCache;
+
+        vk::raii::Pipeline BuildPipeline(const PipelineCacheKey &key, vk::PipelineLayout pipelineLayout);
 
       public:
         GraphicsPipelineCache(GPU &gpu);
@@ -147,7 +154,7 @@ namespace skyline::gpu::cache {
         struct CompiledPipeline {
             vk::DescriptorSetLayout descriptorSetLayout;
             vk::PipelineLayout pipelineLayout;
-            vk::Pipeline pipeline;
+            std::shared_future<vk::raii::Pipeline> pipeline;
 
             CompiledPipeline(const PipelineCacheEntry &entry);
         };
@@ -158,5 +165,10 @@ namespace skyline::gpu::cache {
          * @note Input/Resolve attachments are **not** supported and using them with the supplied pipeline will result in UB
          */
         CompiledPipeline GetCompiledPipeline(const PipelineState& state, span<const vk::DescriptorSetLayoutBinding> layoutBindings, span<const vk::PushConstantRange> pushConstantRanges = {}, bool noPushDescriptors = false);
+
+        /**
+         * @brief Waits until the pipeline compilation thread pool is idle and all pipelines have been compiled
+         */
+        void WaitIdle();
     };
 }

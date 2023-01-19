@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <gpu/interconnect/kepler_compute/kepler_compute.h>
 #include "engine.h"
 #include "inline2memory.h"
 
@@ -18,7 +19,10 @@ namespace skyline::soc::gm20b::engine {
     class KeplerCompute {
       private:
         host1x::SyncpointSet &syncpoints;
+        ChannelContext &channelCtx;
         Inline2MemoryBackend i2m;
+        gpu::interconnect::DirtyManager dirtyManager;
+        gpu::interconnect::kepler_compute::KeplerCompute interconnect;
 
         void HandleMethod(u32 method, u32 argument);
 
@@ -55,6 +59,10 @@ namespace skyline::soc::gm20b::engine {
                 u32 qmdAddressShifted8;
                 u32 from : 24;
                 u8 delta;
+
+                u64 QmdAddress() const {
+                    return static_cast<u64>(qmdAddressShifted8) << 8;
+                }
             };
             static_assert(sizeof(SendPcas) == 0x8);
 
@@ -95,10 +103,8 @@ namespace skyline::soc::gm20b::engine {
 
             Register<0x54A, u32> shaderExceptions;
 
-            Register<0x557, Address> texSamplerPool;
-            Register<0x559, u32> texSamplerPoolMaximumIndex;
-            Register<0x55D, Address> texHeaderPool;
-            Register<0x55F, u32> texHeaderPoolMaximumIndex;
+            Register<0x557, TexSamplerPool> texSamplerPool;
+            Register<0x55D, TexHeaderPool> texHeaderPool;
 
             Register<0x582, Address> programRegion;
 
@@ -149,12 +155,6 @@ namespace skyline::soc::gm20b::engine {
             static_assert(sizeof(ReportSemaphore) == 0x10);
 
             Register<0x6C0, ReportSemaphore> reportSemaphore;
-
-            struct BindlessTexture {
-                u8 constantBufferSlotSelect : 3;
-                u32 _pad_ : 29;
-            };
-            static_assert(sizeof(BindlessTexture) == 0x4);
 
             Register<0x982, BindlessTexture> bindlessTexture;
         } registers{};

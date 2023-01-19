@@ -6,7 +6,7 @@
 
 namespace skyline::gpu {
     TraitManager::TraitManager(const DeviceFeatures2 &deviceFeatures2, DeviceFeatures2 &enabledFeatures2, const std::vector<vk::ExtensionProperties> &deviceExtensions, std::vector<std::array<char, VK_MAX_EXTENSION_NAME_SIZE>> &enabledExtensions, const DeviceProperties2 &deviceProperties2, const vk::raii::PhysicalDevice &physicalDevice) : quirks(deviceProperties2.get<vk::PhysicalDeviceProperties2>().properties, deviceProperties2.get<vk::PhysicalDeviceDriverProperties>()) {
-        bool hasCustomBorderColorExt{}, hasShaderAtomicInt64Ext{}, hasShaderFloat16Int8Ext{}, hasShaderDemoteToHelperExt{}, hasVertexAttributeDivisorExt{}, hasProvokingVertexExt{}, hasPrimitiveTopologyListRestartExt{}, hasImagelessFramebuffersExt{}, hasTransformFeedbackExt{}, hasUint8IndicesExt{};
+        bool hasCustomBorderColorExt{}, hasShaderAtomicInt64Ext{}, hasShaderFloat16Int8Ext{}, hasShaderDemoteToHelperExt{}, hasVertexAttributeDivisorExt{}, hasProvokingVertexExt{}, hasPrimitiveTopologyListRestartExt{}, hasImagelessFramebuffersExt{}, hasTransformFeedbackExt{}, hasUint8IndicesExt{}, hasExtendedDynamicStateExt{}, hasRobustness2Ext{};
         bool supportsUniformBufferStandardLayout{}; // We require VK_KHR_uniform_buffer_standard_layout but assume it is implicitly supported even when not present
 
         for (auto &extension : deviceExtensions) {
@@ -46,7 +46,8 @@ namespace skyline::gpu {
                 EXT_SET("VK_EXT_provoking_vertex", hasProvokingVertexExt);
                 EXT_SET("VK_EXT_vertex_attribute_divisor", hasVertexAttributeDivisorExt);
                 EXT_SET_COND("VK_KHR_push_descriptor", supportsPushDescriptors, !quirks.brokenPushDescriptors);
-                EXT_SET("VK_KHR_imageless_framebuffer", hasImagelessFramebuffersExt);
+                EXT_SET("VK_KHR_image_format_list", supportsImageFormatList);
+                EXT_SET_COND("VK_KHR_imageless_framebuffer", hasImagelessFramebuffersExt, supportsImageFormatList);
                 EXT_SET("VK_EXT_global_priority", supportsGlobalPriority);
                 EXT_SET("VK_EXT_shader_viewport_index_layer", supportsShaderViewportIndexLayer);
                 EXT_SET("VK_KHR_spirv_1_4", supportsSpirv14);
@@ -57,8 +58,11 @@ namespace skyline::gpu {
                 EXT_SET("VK_KHR_uniform_buffer_standard_layout", supportsUniformBufferStandardLayout);
                 EXT_SET("VK_EXT_primitive_topology_list_restart", hasPrimitiveTopologyListRestartExt);
                 EXT_SET("VK_EXT_transform_feedback", hasTransformFeedbackExt);
+                EXT_SET("VK_EXT_extended_dynamic_state", hasExtendedDynamicStateExt);
+                EXT_SET("VK_EXT_robustness2", hasRobustness2Ext);
             }
 
+            #undef EXT_SET_COND
             #undef EXT_SET
             #undef EXT_SET_V
         }
@@ -82,6 +86,20 @@ namespace skyline::gpu {
             FEAT_SET(vk::PhysicalDeviceIndexTypeUint8FeaturesEXT, indexTypeUint8, supportsUint8Indices)
         else
             enabledFeatures2.unlink<vk::PhysicalDeviceIndexTypeUint8FeaturesEXT>();
+
+        if (hasExtendedDynamicStateExt)
+            FEAT_SET(vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, extendedDynamicState, supportsExtendedDynamicState)
+        else
+            enabledFeatures2.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+
+        if (hasRobustness2Ext) {
+            FEAT_SET(vk::PhysicalDeviceRobustness2FeaturesEXT, nullDescriptor, supportsNullDescriptor)
+            FEAT_SET(vk::PhysicalDeviceFeatures2, features.robustBufferAccess, std::ignore)
+            FEAT_SET(vk::PhysicalDeviceRobustness2FeaturesEXT, robustBufferAccess2, std::ignore)
+            FEAT_SET(vk::PhysicalDeviceRobustness2FeaturesEXT, robustImageAccess2, std::ignore)
+        } else {
+            enabledFeatures2.unlink<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+        }
 
         if (hasCustomBorderColorExt) {
             bool hasCustomBorderColorFeature{};
@@ -139,9 +157,9 @@ namespace skyline::gpu {
         }
 
         if (hasImagelessFramebuffersExt) {
-            FEAT_SET(vk::PhysicalDeviceImagelessFramebufferFeatures, imagelessFramebuffer, supportsImagelessFramebuffers)
+            FEAT_SET(vk::PhysicalDeviceImagelessFramebufferFeaturesKHR, imagelessFramebuffer, supportsImagelessFramebuffers)
         } else {
-            enabledFeatures2.unlink<vk::PhysicalDeviceImagelessFramebufferFeatures>();
+            enabledFeatures2.unlink<vk::PhysicalDeviceImagelessFramebufferFeaturesKHR>();
         }
 
         if (hasTransformFeedbackExt) {
@@ -187,6 +205,15 @@ namespace skyline::gpu {
         bcnSupport[4] = isFormatSupported(vk::Format::eBc5UnormBlock) && isFormatSupported(vk::Format::eBc5SnormBlock);
         bcnSupport[5] = isFormatSupported(vk::Format::eBc6HSfloatBlock) && isFormatSupported(vk::Format::eBc6HUfloatBlock);
         bcnSupport[6] = isFormatSupported(vk::Format::eBc7UnormBlock) && isFormatSupported(vk::Format::eBc7SrgbBlock);
+
+        auto memoryProps{physicalDevice.getMemoryProperties2()};
+        constexpr auto ReqMemFlags{vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached};
+        for (u32 i{}; i < memoryProps.memoryProperties.memoryTypeCount; i++)
+            if ((memoryProps.memoryProperties.memoryTypes[i].propertyFlags & ReqMemFlags) == ReqMemFlags)
+                hostVisibleCoherentCachedMemoryType = i;
+
+
+        minimumStorageBufferAlignment = static_cast<u32>(deviceProperties2.get().properties.limits.minStorageBufferOffsetAlignment);
     }
 
     std::string TraitManager::Summary() {
@@ -210,6 +237,14 @@ namespace skyline::gpu {
 
                 if (deviceProperties.driverVersion < VK_MAKE_VERSION(512, 600, 0))
                     maxSubpassCount = 64; // Driver will segfault while destroying the renderpass and associated objects if this is exceeded on all 5xx and below drivers
+
+                if (deviceProperties.driverVersion >= VK_MAKE_VERSION(512, 615, 0) && deviceProperties.driverVersion <= VK_MAKE_VERSION(512, 615, 512))
+                    brokenMultithreadedPipelineCompilation = true;
+
+                if (deviceProperties.driverVersion < VK_MAKE_VERSION(512, 672, 0))
+                    brokenSubgroupMaskExtractDynamic = true;
+
+                brokenSubgroupShuffle = true;
                 maxGlobalPriority = vk::QueueGlobalPriorityEXT::eHigh;
                 break;
             }
@@ -222,6 +257,7 @@ namespace skyline::gpu {
 
             case vk::DriverId::eArmProprietary: {
                 maxGlobalPriority = vk::QueueGlobalPriorityEXT::eHigh;
+                brokenComputeShaders = true;
                 break;
             }
 
@@ -247,7 +283,7 @@ namespace skyline::gpu {
         );
     }
 
-    void TraitManager::ApplyDriverPatches(const vk::raii::Context &context) {
+    void TraitManager::ApplyDriverPatches(const vk::raii::Context &context, adrenotools_gpu_mapping *mapping) {
         // Create an instance without validation layers in order to get pointers to the functions we need to patch from the driver
         vk::ApplicationInfo applicationInfo{
             .apiVersion = VK_API_VERSION_1_0,
@@ -271,6 +307,11 @@ namespace skyline::gpu {
         } else if (type == ADRENOTOOLS_BCN_BLOB) {
             Logger::Info("BCeNabler skipped, blob BCN support is present");
             bcnSupport.set();
+        }
+
+        if (adrenotools_validate_gpu_mapping(mapping)) {
+            Logger::Info("Applied GPU memory import patch");
+            supportsAdrenoDirectMemoryImport = true;
         }
     }
 }

@@ -12,7 +12,8 @@ import android.view.KeyEvent
 import android.view.ViewTreeObserver
 import androidx.appcompat.app.AppCompatActivity
 import androidx.coordinatorlayout.widget.CoordinatorLayout
-import androidx.core.view.*
+import androidx.core.view.WindowCompat
+import androidx.core.view.marginTop
 import androidx.recyclerview.widget.DividerItemDecoration
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -29,6 +30,7 @@ import emu.skyline.input.dialog.RumbleDialog
 import emu.skyline.input.dialog.StickDialog
 import emu.skyline.input.onscreen.OnScreenEditActivity
 import emu.skyline.utils.PreferenceSettings
+import emu.skyline.utils.WindowInsetsHelper
 import javax.inject.Inject
 
 /**
@@ -86,6 +88,11 @@ class ControllerActivity : AppCompatActivity() {
                 items.add(ControllerCheckBoxViewItem(getString(R.string.osc_enable), oscSummary.invoke(preferenceSettings.onScreenControl), preferenceSettings.onScreenControl) { item, position ->
                     item.summary = oscSummary.invoke(item.checked)
                     preferenceSettings.onScreenControl = item.checked
+                    adapter.notifyItemChanged(position)
+                })
+
+                items.add(ControllerCheckBoxViewItem(getString(R.string.osc_feedback), getString(R.string.osc_feedback_description), preferenceSettings.onScreenControlFeedback) { item, position ->
+                    preferenceSettings.onScreenControlFeedback = item.checked
                     adapter.notifyItemChanged(position)
                 })
 
@@ -173,12 +180,7 @@ class ControllerActivity : AppCompatActivity() {
 
         setContentView(binding.root)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        // Apply inset padding to the controller list recycler view to avoid navigation bar overlap
-        ViewCompat.setOnApplyWindowInsetsListener(binding.controllerList) { view, windowInsets ->
-            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.updatePadding(bottom = insets.bottom)
-            WindowInsetsCompat.CONSUMED
-        }
+        WindowInsetsHelper.applyToActivity(binding.root, binding.controllerList)
 
         setSupportActionBar(binding.titlebar.toolbar)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -315,7 +317,7 @@ class ControllerActivity : AppCompatActivity() {
             GeneralType.SetupGuide -> {
                 var dialogFragment : BottomSheetDialogFragment? = null
 
-                for (buttonItem in buttonItems.reversed())
+                for (buttonItem in buttonItems.reversed().filter { it.button != ButtonId.Menu })
                     dialogFragment = ButtonDialog(buttonItem, dialogFragment)
 
                 for (stickItem in stickItems.reversed())

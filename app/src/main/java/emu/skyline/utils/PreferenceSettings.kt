@@ -25,6 +25,7 @@ class PreferenceSettings @Inject constructor(@ApplicationContext private val con
     // System
     var isDocked by sharedPreferences(context, true)
     var usernameValue by sharedPreferences(context, context.getString(R.string.username_default))
+    var profilePictureValue by sharedPreferences(context, "")
     var systemLanguage by sharedPreferences(context, 1)
     var systemRegion by sharedPreferences(context, -1)
 
@@ -38,14 +39,23 @@ class PreferenceSettings @Inject constructor(@ApplicationContext private val con
 
     // GPU
     var gpuDriver by sharedPreferences(context, SYSTEM_GPU_DRIVER)
-    var executorSlotCount by sharedPreferences(context, 6)
-    var enableTextureReadbackHack by sharedPreferences(context, false)
+    var executorSlotCountScale by sharedPreferences(context, 6)
+    var executorFlushThreshold by sharedPreferences(context, 256)
+    var useDirectMemoryImport by sharedPreferences(context, false)
+    var forceMaxGpuClocks by sharedPreferences(context, false)
+
+    // Hacks
+    var enableFastGpuReadbackHack by sharedPreferences(context, false)
+
+    // Audio
+    var isAudioOutputDisabled by sharedPreferences(context, false)
 
     // Debug
     var validationLayer by sharedPreferences(context, false)
 
     // Input
     var onScreenControl by sharedPreferences(context, true)
+    var onScreenControlFeedback by sharedPreferences(context, true)
     var onScreenControlRecenterSticks by sharedPreferences(context, true)
 
     // Other

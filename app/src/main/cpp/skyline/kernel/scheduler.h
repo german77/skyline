@@ -58,11 +58,16 @@ namespace skyline {
             std::list<std::shared_ptr<type::KThread>> parkedQueue; //!< A queue of threads which are parked and waiting on core migration
 
             /**
-             * @brief Migrate a thread from its resident core to its ideal core
+             * @brief Migrate a thread from its resident core to the target core
              * @note 'KThread::coreMigrationMutex' **must** be locked by the calling thread prior to calling this
              * @note This is used to handle non-cooperative core affinity mask changes where the resident core is not in its new affinity mask
              */
             void MigrateToCore(const std::shared_ptr<type::KThread> &thread, CoreContext *&currentCore, CoreContext *targetCore, std::unique_lock<std::mutex> &lock);
+
+            /**
+             * @brief Trigger a thread to yield via a signal or on SVC exit if it is the current thread
+             */
+            void YieldThread(const std::shared_ptr<type::KThread> &thread);
 
           public:
             static constexpr std::chrono::milliseconds PreemptiveTimeslice{10}; //!< The duration of time a preemptive thread can run before yielding
@@ -87,6 +92,7 @@ namespace skyline {
 
             /**
              * @brief Inserts the specified thread into the scheduler queue at the appropriate location based on its priority
+             * @note This is a non-blocking operation when the thread is paused, the thread will only be inserted when it is resumed
              */
             void InsertThread(const std::shared_ptr<type::KThread> &thread);
 
@@ -123,6 +129,7 @@ namespace skyline {
             /**
              * @brief Updates the core that the supplied thread is resident to according to its new affinity mask and ideal core
              * @note This supports changing the core of a thread which is currently running
+             * @note 'KThread::coreMigrationMutex' **must** be locked by the calling thread prior to calling this
              */
             void UpdateCore(const std::shared_ptr<type::KThread> &thread);
 

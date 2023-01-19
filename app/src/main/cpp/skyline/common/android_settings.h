@@ -33,14 +33,19 @@ namespace skyline {
         void Update() override {
             isDocked = ktSettings.GetBool("isDocked");
             usernameValue = std::move(ktSettings.GetString("usernameValue"));
+            profilePictureValue = ktSettings.GetString("profilePictureValue");
             systemLanguage = ktSettings.GetInt<skyline::language::SystemLanguage>("systemLanguage");
             systemRegion = ktSettings.GetInt<skyline::region::RegionCode>("systemRegion");
             forceTripleBuffering = ktSettings.GetBool("forceTripleBuffering");
             disableFrameThrottling = ktSettings.GetBool("disableFrameThrottling");
             gpuDriver = ktSettings.GetString("gpuDriver");
             gpuDriverLibraryName = ktSettings.GetString("gpuDriverLibraryName");
-            executorSlotCount = ktSettings.GetInt<u32>("executorSlotCount");
-            enableTextureReadbackHack = ktSettings.GetBool("enableTextureReadbackHack");
+            executorSlotCountScale = ktSettings.GetInt<u32>("executorSlotCountScale");
+            executorFlushThreshold = ktSettings.GetInt<u32>("executorFlushThreshold");
+            useDirectMemoryImport = ktSettings.GetBool("useDirectMemoryImport");
+            forceMaxGpuClocks = ktSettings.GetBool("forceMaxGpuClocks");
+            enableFastGpuReadbackHack = ktSettings.GetBool("enableFastGpuReadbackHack");
+            isAudioOutputDisabled = ktSettings.GetBool("isAudioOutputDisabled");
             validationLayer = ktSettings.GetBool("validationLayer");
         };
     };

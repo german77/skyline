@@ -12,7 +12,7 @@
 
 namespace skyline::loader {
     Loader::ExecutableLoadInfo Loader::LoadExecutable(const std::shared_ptr<kernel::type::KProcess> &process, const DeviceState &state, Executable &executable, size_t offset, const std::string &name, bool dynamicallyLinked) {
-        u8 *base{reinterpret_cast<u8 *>(process->memory.base.data() + offset)};
+        u8 *base{reinterpret_cast<u8 *>(process->memory.code.data() + offset)};
 
         size_t textSize{executable.text.contents.size()};
         size_t roSize{executable.ro.contents.size()};
@@ -34,56 +34,76 @@ namespace skyline::loader {
         std::vector<nce::NCE::HookedSymbolEntry> executableSymbols;
         size_t hookSize{};
         if (dynamicallyLinked) {
-            for (auto &symbol : dynsym) {
-                if (symbol.st_name == 0 || symbol.st_value == 0)
-                    continue;
+            if constexpr (!hle::HookedSymbols.empty()) {
+                for (auto &symbol : dynsym) {
+                    if (symbol.st_name == 0 || symbol.st_value == 0)
+                        continue;
 
-                if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL || symbol.st_shndx == SHN_UNDEF)
-                    continue;
+                    if (ELF64_ST_TYPE(symbol.st_info) != STT_FUNC || ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL || symbol.st_shndx == SHN_UNDEF)
+                        continue;
 
-                std::string_view symbolName{dynstr.data() + symbol.st_name};
+                    std::string_view symbolName{dynstr.data() + symbol.st_name};
 
-                auto item{std::find_if(hle::HookedSymbols.begin(), hle::HookedSymbols.end(), [&symbolName](const auto &item) {
-                    return item.name == symbolName;
-                })};
-                if (item != hle::HookedSymbols.end()) {
-                    executableSymbols.emplace_back(std::string{symbolName}, item->hook, &symbol.st_value);
-                    continue;
+                    auto item{std::find_if(hle::HookedSymbols.begin(), hle::HookedSymbols.end(), [&symbolName](const auto &item) {
+                        return item.name == symbolName;
+                    })};
+                    if (item != hle::HookedSymbols.end()) {
+                        executableSymbols.emplace_back(std::string{symbolName}, item->hook, &symbol.st_value);
+                        continue;
+                    }
+
+                    #ifdef PRINT_HOOK_ALL
+                    if (symbolName == "memcpy" || symbolName == "memcmp" || symbolName == "memset" || symbolName == "strcmp" ||  symbolName == "strlen")
+                        // If symbol is from libc (such as memcpy, strcmp, strlen, etc), we don't need to hook it
+                        continue;
+
+                    executableSymbols.emplace_back(std::string{symbolName}, hle::EntryExitHook{
+                        .entry = [](const DeviceState &, const hle::HookedSymbol &symbol) {
+                            Logger::Error("Entering \"{}\" ({})", symbol.prettyName, symbol.name);
+                        },
+                        .exit = [](const DeviceState &, const hle::HookedSymbol &symbol) {
+                            Logger::Error("Exiting \"{}\"", symbol.prettyName);
+                        },
+                    }, &symbol.st_value);
+                    #endif
                 }
-
-                #ifdef PRINT_HOOK_ALL
-                if (symbolName == "memcpy" || symbolName == "memcmp" || symbolName == "memset" || symbolName == "strcmp" ||  symbolName == "strlen")
-                    // If symbol is from libc (such as memcpy, strcmp, strlen, etc), we don't need to hook it
-                    continue;
-
-                executableSymbols.emplace_back(std::string{symbolName}, hle::EntryExitHook{
-                    .entry = [](const DeviceState &, const hle::HookedSymbol &symbol) {
-                        Logger::Error("Entering \"{}\" ({})", symbol.prettyName, symbol.name);
-                    },
-                    .exit = [](const DeviceState &, const hle::HookedSymbol &symbol) {
-                        Logger::Error("Exiting \"{}\"", symbol.prettyName);
-                    },
-                }, &symbol.st_value);
-                #endif
             }
+
+            #ifdef PRINT_HOOK_ALL
+            for (auto &symbol : dynsym) {
+                if (symbolName == "memcpy" || symbolName == "memcmp" || symbolName == "memset" || symbolName == "strcmp" ||  symbolName == "strlen")
+                        // If symbol is from libc (such as memcpy, strcmp, strlen, etc), we don't need to hook it
+                        continue;
+
+                    executableSymbols.emplace_back(std::string{symbolName}, hle::EntryExitHook{
+                        .entry = [](const DeviceState &, const hle::HookedSymbol &symbol) {
+                            Logger::Error("Entering \"{}\" ({})", symbol.prettyName, symbol.name);
+                        },
+                        .exit = [](const DeviceState &, const hle::HookedSymbol &symbol) {
+                            Logger::Error("Exiting \"{}\"", symbol.prettyName);
+                        },
+                    }, &symbol.st_value);
+            }
+            #endif
 
             hookSize = util::AlignUp(state.nce->GetHookSectionSize(executableSymbols), PAGE_SIZE);
         }
 
-        process->NewHandle<kernel::type::KPrivateMemory>(span<u8>{base, patch.size + hookSize}, memory::Permission{false, false, false}, memory::states::Reserved); // ---
-        Logger::Error("Successfully mapped section .patch @ 0x{:X}, Size = 0x{:X}", base, patch.size);
+        auto patchType{process->memory.addressSpaceType == memory::AddressSpaceType::AddressSpace36Bit ? memory::states::Heap : memory::states::Reserved};
+        process->NewHandle<kernel::type::KPrivateMemory>(span<u8>{base, patch.size + hookSize}, memory::Permission{false, false, false}, patchType); // ---
+        Logger::Debug("Successfully mapped section .patch @ 0x{:X}, Size = 0x{:X}", base, patch.size);
         if (hookSize > 0)
-            Logger::Error("Successfully mapped section .hook @ 0x{:X}, Size = 0x{:X}", base + patch.size, hookSize);
+            Logger::Debug("Successfully mapped section .hook @ 0x{:X}, Size = 0x{:X}", base + patch.size, hookSize);
 
         u8 *executableBase{base + patch.size + hookSize};
         process->NewHandle<kernel::type::KPrivateMemory>(span<u8>{executableBase + executable.text.offset, textSize}, memory::Permission{true, false, true}, memory::states::CodeStatic); // R-X
-        Logger::Error("Successfully mapped section .text @ 0x{:X}, Size = 0x{:X}", executableBase, textSize);
+        Logger::Debug("Successfully mapped section .text @ 0x{:X}, Size = 0x{:X}", executableBase, textSize);
 
         process->NewHandle<kernel::type::KPrivateMemory>(span<u8>{executableBase + executable.ro.offset, roSize}, memory::Permission{true, false, false}, memory::states::CodeStatic); // R--
-        Logger::Error("Successfully mapped section .rodata @ 0x{:X}, Size = 0x{:X}", executableBase + executable.ro.offset, roSize);
+        Logger::Debug("Successfully mapped section .rodata @ 0x{:X}, Size = 0x{:X}", executableBase + executable.ro.offset, roSize);
 
         process->NewHandle<kernel::type::KPrivateMemory>(span<u8>{executableBase + executable.data.offset, dataSize}, memory::Permission{true, true, false}, memory::states::CodeMutable); // RW-
-        Logger::Error("Successfully mapped section .data + .bss @ 0x{:X}, Size = 0x{:X}", executableBase + executable.data.offset, dataSize);
+        Logger::Debug("Successfully mapped section .data + .bss @ 0x{:X}, Size = 0x{:X}", executableBase + executable.data.offset, dataSize);
 
         size_t size{patch.size + hookSize + textSize + roSize + dataSize};
         {

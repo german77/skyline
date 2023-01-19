@@ -6,22 +6,18 @@
 #include <tsl/robin_map.h>
 #include <shader_compiler/frontend/ir/program.h>
 #include <gpu/cache/graphics_pipeline_cache.h>
+#include <gpu/interconnect/common/samplers.h>
+#include <gpu/interconnect/common/textures.h>
+#include <gpu/interconnect/common/pipeline_state_accessor.h>
 #include "common.h"
 #include "packed_pipeline_state.h"
 #include "constant_buffers.h"
-#include "samplers.h"
-#include "textures.h"
 
 namespace skyline::gpu {
     class TextureView;
 }
 
 namespace skyline::gpu::interconnect::maxwell3d {
-    struct ShaderBinary {
-        span<u8> binary;
-        u32 baseOffset;
-    };
-
     class Pipeline {
       public:
         struct ShaderStage {
@@ -86,9 +82,11 @@ namespace skyline::gpu::interconnect::maxwell3d {
             u32 totalImageDescCount;
         };
 
+        PackedPipelineState sourcePackedState;
+
       private:
         std::vector<CachedMappedBufferView> storageBufferViews;
-        u32 lastExecutionNumber{}; //!< The last execution number this pipeline was used at
+        ContextTag lastExecutionTag{}; //!< The last execution tag this pipeline was used at
         std::array<ShaderStage, engine::ShaderStageCount> shaderStages;
         DescriptorInfo descriptorInfo;
 
@@ -97,15 +95,13 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         tsl::robin_map<Pipeline *, bool> bindingMatchCache; //!< Cache of which pipelines have bindings that match this pipeline
 
-        void SyncCachedStorageBufferViews(u32 executionNumber);
+        void SyncCachedStorageBufferViews(ContextTag executionTag);
 
       public:
         cache::GraphicsPipelineCache::CompiledPipeline compiledPipeline;
         size_t sampledImageCount{};
 
-        PackedPipelineState sourcePackedState;
-
-        Pipeline(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries, span<TextureView *> colorAttachments, TextureView *depthAttachment);
+        Pipeline(GPU &gpu, PipelineStateAccessor &accessor, const PackedPipelineState &packedState);
 
         Pipeline *LookupNext(const PackedPipelineState &packedState);
 
@@ -128,17 +124,16 @@ namespace skyline::gpu::interconnect::maxwell3d {
         DescriptorUpdateInfo *SyncDescriptorsQuickBind(InterconnectContext &ctx, ConstantBufferSet &constantBuffers, Samplers &samplers, Textures &textures, ConstantBuffers::QuickBind quickBind, span<TextureView *> sampledImages);
     };
 
+    /**
+     * @brief Manages the caching and creation of pipelines
+     */
     class PipelineManager {
       private:
         tsl::robin_map<PackedPipelineState, std::unique_ptr<Pipeline>, PackedPipelineStateHash> map;
 
       public:
-        Pipeline *FindOrCreate(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries, span<TextureView *> colorAttachments, TextureView *depthAttachment) {
-            auto it{map.find(packedState)};
-            if (it != map.end())
-                return it->second.get();
+        PipelineManager(GPU &gpu);
 
-            return map.emplace(packedState, std::make_unique<Pipeline>(ctx, textures, constantBuffers, packedState, shaderBinaries, colorAttachments, depthAttachment)).first->second.get();
-        }
+        Pipeline *FindOrCreate(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries);
     };
 }

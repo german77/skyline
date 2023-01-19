@@ -32,6 +32,8 @@ namespace skyline {
         */
         class IAccountServiceForApplication : public BaseService {
           private:
+            std::vector<account::UserId> openedUsers;
+
             /**
              * @brief Writes a vector of 128-bit user IDs to an output buffer
              */
@@ -58,6 +60,11 @@ namespace skyline {
             Result IsUserRegistrationRequestPermitted(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
             /**
+             * @url https://switchbrew.org/wiki/Account_services#TrySelectUserWithoutInteraction
+             */
+            Result TrySelectUserWithoutInteraction(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
+            /**
              * @url https://switchbrew.org/wiki/Account_services#InitializeApplicationInfoV0
              */
             Result InitializeApplicationInfoV0(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
@@ -75,6 +82,8 @@ namespace skyline {
             */
             Result InitializeApplicationInfo(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
+            Result ListQualifiedUsers(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
             Result IsUserAccountSwitchLocked(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
             Result InitializeApplicationInfoV2(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
@@ -87,12 +96,14 @@ namespace skyline {
               SFUNC(0x4, IAccountServiceForApplication, GetLastOpenedUser),
               SFUNC(0x5, IAccountServiceForApplication, GetProfile),
               SFUNC(0x32, IAccountServiceForApplication, IsUserRegistrationRequestPermitted),
+              SFUNC(0x33, IAccountServiceForApplication, TrySelectUserWithoutInteraction),
               SFUNC(0x64, IAccountServiceForApplication, InitializeApplicationInfoV0),
               SFUNC(0x65, IAccountServiceForApplication, GetBaasAccountManagerForApplication),
               SFUNC(0x6E, IAccountServiceForApplication, StoreSaveDataThumbnail),
               SFUNC(0x82, IAccountServiceForApplication, LoadOpenContext),
               SFUNC(0x83, IAccountServiceForApplication, ListOpenContextStoredUsers),
               SFUNC(0x8C, IAccountServiceForApplication, InitializeApplicationInfo),
+              SFUNC(0x8D, IAccountServiceForApplication, ListQualifiedUsers),
               SFUNC(0x96, IAccountServiceForApplication, IsUserAccountSwitchLocked),
               SFUNC(0xA0, IAccountServiceForApplication, InitializeApplicationInfoV2)
           )

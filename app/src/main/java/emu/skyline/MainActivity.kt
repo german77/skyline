@@ -18,7 +18,9 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import androidx.core.content.res.use
 import androidx.core.graphics.drawable.toBitmap
-import androidx.core.view.*
+import androidx.core.view.WindowCompat
+import androidx.core.view.isInvisible
+import androidx.core.view.isVisible
 import androidx.documentfile.provider.DocumentFile
 import androidx.preference.PreferenceManager
 import androidx.recyclerview.widget.GridLayoutManager
@@ -34,7 +36,9 @@ import emu.skyline.loader.AppEntry
 import emu.skyline.loader.LoaderResult
 import emu.skyline.loader.RomFormat
 import emu.skyline.provider.DocumentsProvider
+import emu.skyline.utils.GpuDriverHelper
 import emu.skyline.utils.PreferenceSettings
+import emu.skyline.utils.WindowInsetsHelper
 import javax.inject.Inject
 import kotlin.math.ceil
 
@@ -100,12 +104,7 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(binding.root)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        // Apply inset padding to the app list recycler view to avoid navigation bar overlap
-        ViewCompat.setOnApplyWindowInsetsListener(binding.appList) { view, windowInsets ->
-            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.updatePadding(bottom = insets.bottom)
-            WindowInsetsCompat.CONSUMED
-        }
+        WindowInsetsHelper.applyToActivity(binding.root, binding.appList)
 
         PreferenceManager.setDefaultValues(this, R.xml.preferences, false)
 
@@ -279,6 +278,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+
+        // Try to return to normal GPU clocks upon resuming back to main activity, to avoid GPU being stuck at max clocks after a crash
+        if (preferenceSettings.forceMaxGpuClocks)
+            GpuDriverHelper.forceMaxGpuClocks(false)
 
         var layoutTypeChanged = false
         for (appViewItem in adapter.allItems.filterIsInstance(AppViewItem::class.java)) {

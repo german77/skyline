@@ -8,7 +8,6 @@
 #include <kernel/memory.h>
 #include <soc/gm20b/channel.h>
 #include <soc/gm20b/gmmu.h>
-#include <gpu/texture/format.h>
 #include <gpu.h>
 #include "pipeline_state.h"
 
@@ -34,94 +33,6 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
     ColorRenderTargetState::ColorRenderTargetState(dirty::Handle dirtyHandle, DirtyManager &manager, const EngineRegisters &engine, size_t index) : engine{manager, dirtyHandle, engine}, index{index} {}
 
-    static texture::Format ConvertColorRenderTargetFormat(engine::ColorTarget::Format format) {
-        #define FORMAT_CASE_BASE(engineFormat, skFormat, warn) \
-                case engine::ColorTarget::Format::engineFormat:                     \
-                    if constexpr (warn)                                             \
-                        Logger::Warn("Partially supported RT format: " #engineFormat " used!"); \
-                    return skyline::gpu::format::skFormat
-
-        #define FORMAT_CASE(engineFormat, skFormat) FORMAT_CASE_BASE(engineFormat, skFormat, false)
-        #define FORMAT_CASE_WARN(engineFormat, skFormat) FORMAT_CASE_BASE(engineFormat, skFormat, true)
-
-        switch (format) {
-            FORMAT_CASE(RF32_GF32_BF32_AF32, R32G32B32A32Float);
-            FORMAT_CASE(RS32_GS32_BS32_AS32, R32G32B32A32Sint);
-            FORMAT_CASE(RU32_GU32_BU32_AU32, R32G32B32A32Uint);
-            FORMAT_CASE_WARN(RF32_GF32_BF32_X32, R32G32B32A32Float); // TODO: ignore X32 component with blend
-            FORMAT_CASE_WARN(RS32_GS32_BS32_X32, R32G32B32A32Sint); // TODO: ^
-            FORMAT_CASE_WARN(RU32_GU32_BU32_X32, R32G32B32A32Uint); // TODO: ^
-            FORMAT_CASE(R16_G16_B16_A16, R16G16B16A16Unorm);
-            FORMAT_CASE(RN16_GN16_BN16_AN16, R16G16B16A16Snorm);
-            FORMAT_CASE(RS16_GS16_BS16_AS16, R16G16B16A16Sint);
-            FORMAT_CASE(RU16_GU16_BU16_AU16, R16G16B16A16Uint);
-            FORMAT_CASE(RF16_GF16_BF16_AF16, R16G16B16A16Float);
-            FORMAT_CASE(RF32_GF32, R32G32Float);
-            FORMAT_CASE(RS32_GS32, R32G32Sint);
-            FORMAT_CASE(RU32_GU32, R32G32Uint);
-            FORMAT_CASE_WARN(RF16_GF16_BF16_X16, R16G16B16A16Float); // TODO: ^^
-            FORMAT_CASE(A8R8G8B8, B8G8R8A8Unorm);
-            FORMAT_CASE(A8RL8GL8BL8, B8G8R8A8Srgb);
-            FORMAT_CASE(A2B10G10R10, A2B10G10R10Unorm);
-            FORMAT_CASE(AU2BU10GU10RU10, A2B10G10R10Uint);
-            FORMAT_CASE(A8B8G8R8, R8G8B8A8Unorm);
-            FORMAT_CASE(A8BL8GL8RL8, R8G8B8A8Srgb);
-            FORMAT_CASE(AN8BN8GN8RN8, R8G8B8A8Snorm);
-            FORMAT_CASE(AS8BS8GS8RS8, R8G8B8A8Sint);
-            FORMAT_CASE(AU8BU8GU8RU8, R8G8B8A8Uint);
-            FORMAT_CASE(R16_G16, R16G16Unorm);
-            FORMAT_CASE(RN16_GN16, R16G16Snorm);
-            FORMAT_CASE(RS16_GS16, R16G16Sint);
-            FORMAT_CASE(RU16_GU16, R16G16Uint);
-            FORMAT_CASE(RF16_GF16, R16G16Float);
-            FORMAT_CASE(A2R10G10B10, A2B10G10R10Unorm);
-            FORMAT_CASE(BF10GF11RF11, B10G11R11Float);
-            FORMAT_CASE(RS32, R32Sint);
-            FORMAT_CASE(RU32, R32Uint);
-            FORMAT_CASE(RF32, R32Float);
-            FORMAT_CASE_WARN(X8R8G8B8, B8G8R8A8Unorm); // TODO: ^^
-            FORMAT_CASE_WARN(X8RL8GL8BL8, B8G8R8A8Srgb); // TODO: ^^
-            FORMAT_CASE(R5G6B5, R5G6B5Unorm);
-            FORMAT_CASE(A1R5G5B5, A1R5G5B5Unorm);
-            FORMAT_CASE(G8R8, R8G8Unorm);
-            FORMAT_CASE(GN8RN8, R8G8Snorm);
-            FORMAT_CASE(GS8RS8, R8G8Sint);
-            FORMAT_CASE(GU8RU8, R8G8Uint);
-            FORMAT_CASE(R16, R16Unorm);
-            FORMAT_CASE(RN16, R16Snorm);
-            FORMAT_CASE(RS16, R16Sint);
-            FORMAT_CASE(RU16, R16Uint);
-            FORMAT_CASE(RF16, R16Float);
-            FORMAT_CASE(R8, R8Unorm);
-            FORMAT_CASE(RN8, R8Snorm);
-            FORMAT_CASE(RS8, R8Sint);
-            FORMAT_CASE(RU8, R8Uint);
-            // FORMAT_CASE(A8, A8Unorm);
-            FORMAT_CASE_WARN(X1R5G5B5, A1R5G5B5Unorm); // TODO: ^^
-            FORMAT_CASE_WARN(X8B8G8R8, R8G8B8A8Unorm); // TODO: ^^
-            FORMAT_CASE_WARN(X8BL8GL8RL8, R8G8B8A8Srgb); // TODO: ^^
-            FORMAT_CASE_WARN(Z1R5G5B5, A1R5G5B5Unorm); // TODO: ^^ but with zero blend
-            FORMAT_CASE_WARN(O1R5G5B5, A1R5G5B5Unorm); // TODO: ^^ but with one blend
-            FORMAT_CASE_WARN(Z8R8G8B8, B8G8R8A8Unorm); // TODO: ^^ but with zero blend
-            FORMAT_CASE_WARN(O8R8G8B8, B8G8R8A8Unorm); // TODO: ^^ but with one blend
-            // FORMAT_CASE(R32, R32Unorm);
-            // FORMAT_CASE(A16, A16Unorm);
-            // FORMAT_CASE(AF16, A16Float);
-            // FORMAT_CASE(AF32, A32Float);
-            // FORMAT_CASE(A8R8, R8A8Unorm);
-            // FORMAT_CASE(R16_A16, R16A16Unorm);
-            // FORMAT_CASE(RF16_AF16, R16A16Float);
-            // FORMAT_CASE(RF32_AF32, R32A32Float);
-            // FORMAT_CASE(B8G8R8A8, A8R8G8B8Unorm)
-            default:
-                throw exception("Unsupported colour rendertarget format: 0x{:X}", static_cast<u32>(format));
-        }
-
-        #undef FORMAT_CASE
-        #undef FORMAT_CASE_WARN
-        #undef FORMAT_CASE_BASE
-    }
-
     void ColorRenderTargetState::Flush(InterconnectContext &ctx, PackedPipelineState &packedState) {
         auto &target{engine->colorTarget};
         packedState.SetColorRenderTargetFormat(index, target.format);
@@ -132,7 +43,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         }
 
         GuestTexture guest{};
-        guest.format = ConvertColorRenderTargetFormat(target.format);
+        guest.format = packedState.GetColorRenderTargetFormat(index);
         guest.aspect = vk::ImageAspectFlagBits::eColor;
         guest.baseArrayLayer = target.layerOffset;
 
@@ -144,7 +55,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
         if (target.memory.layout == engine::TargetMemory::Layout::Pitch) {
             guest.dimensions = texture::Dimensions{target.width / guest.format->bpb, target.height, depth};
             guest.tileConfig = texture::TileConfig{
-                .mode = gpu::texture::TileMode::Linear,
+                .mode = gpu::texture::TileMode::Pitch,
+                .pitch = target.width,
             };
         } else {
             guest.dimensions = gpu::texture::Dimensions{target.width, target.height, depth};
@@ -166,6 +78,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
             view = ctx.gpu.texture.FindOrCreate(guest, ctx.executor.tag);
         } else {
+            packedState.SetColorRenderTargetFormat(index, engine::ColorTarget::Format::Disabled);
             view = {};
         }
     }
@@ -177,28 +90,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
     DepthRenderTargetState::DepthRenderTargetState(dirty::Handle dirtyHandle, DirtyManager &manager, const EngineRegisters &engine) : engine{manager, dirtyHandle, engine} {}
 
-    static texture::Format ConvertDepthRenderTargetFormat(engine::ZtFormat format) {
-        #define FORMAT_CASE(engineFormat, skFormat) \
-            case engine::ZtFormat::engineFormat: \
-                return skyline::gpu::format::skFormat
-
-        switch (format) {
-            FORMAT_CASE(Z16, D16Unorm);
-            FORMAT_CASE(Z24S8, S8UintD24Unorm);
-            FORMAT_CASE(X8Z24, D24UnormX8Uint);
-            FORMAT_CASE(S8Z24, D24UnormS8Uint);
-            FORMAT_CASE(S8, S8Uint);
-            FORMAT_CASE(ZF32, D32Float);
-            FORMAT_CASE(ZF32_X24S8, D32FloatS8Uint);
-            default:
-                throw exception("Unsupported depth rendertarget format: 0x{:X}", static_cast<u32>(format));
-        }
-
-        #undef FORMAT_CASE
-    }
-
     void DepthRenderTargetState::Flush(InterconnectContext &ctx, PackedPipelineState &packedState) {
-        packedState.SetDepthRenderTargetFormat(engine->ztFormat);
+        packedState.SetDepthRenderTargetFormat(engine->ztFormat, engine->ztSelect.targetCount);
 
         if (!engine->ztSelect.targetCount) {
             view = {};
@@ -206,7 +99,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         }
 
         GuestTexture guest{};
-        guest.format = ConvertDepthRenderTargetFormat(engine->ztFormat);
+        guest.format = packedState.GetDepthRenderTargetFormat();
         guest.aspect = guest.format->vkAspect;
         guest.baseArrayLayer = engine->ztLayer.offset;
 
@@ -237,6 +130,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
             view = ctx.gpu.texture.FindOrCreate(guest, ctx.executor.tag);
         } else {
+            packedState.SetDepthRenderTargetFormat(engine->ztFormat, false);
             view = {};
         }
     }
@@ -259,108 +153,15 @@ namespace skyline::gpu::interconnect::maxwell3d {
             return;
         }
 
-        auto[blockMapping, blockOffset]{ctx.channelCtx.asCtx->gmmu.LookupBlock(engine->programRegion + engine->pipeline.programOffset)};
-
-        if (!trapExecutionLock)
-            trapExecutionLock.emplace(trapMutex);
-
-        // Skip looking up the mirror if it is the same as the one used for the previous update
-        if (!mirrorBlock.valid() || !mirrorBlock.contains(blockMapping)) {
-            auto mirrorIt{mirrorMap.find(blockMapping.data())};
-            if (mirrorIt == mirrorMap.end()) {
-                // Allocate a host mirror for the mapping and trap the guest region
-                auto newIt{mirrorMap.emplace(blockMapping.data(), std::make_unique<MirrorEntry>(ctx.memory.CreateMirror(blockMapping)))};
-
-                // We need to create the trap after allocating the entry so that we have an `invalid` pointer we can pass in
-                auto trapHandle{ctx.nce.CreateTrap(blockMapping, [mutex = &trapMutex]() {
-                    std::scoped_lock lock{*mutex};
-                    return;
-                }, []() { return true; }, [entry = newIt.first->second.get(), mutex = &trapMutex]() {
-                    std::unique_lock lock{*mutex, std::try_to_lock};
-                    if (!lock)
-                        return false;
-
-                    if (++entry->trapCount <= MirrorEntry::SkipTrapThreshold)
-                        entry->dirty = true;
-                    return true;
-                })};
-
-                // Write only trap
-                ctx.nce.TrapRegions(trapHandle, true);
-
-                entry = newIt.first->second.get();
-                entry->trap = trapHandle;
-            } else {
-                entry = mirrorIt->second.get();
-            }
-
-            mirrorBlock = blockMapping;
-        }
-
-        if (entry->trapCount > MirrorEntry::SkipTrapThreshold && entry->channelSequenceNumber != ctx.channelCtx.channelSequenceNumber) {
-            entry->channelSequenceNumber = ctx.channelCtx.channelSequenceNumber;
-            entry->dirty = true;
-        }
-
-        // If the mirror entry has been written to, clear its shader binary cache and retrap to catch any future writes
-        if (entry->dirty) {
-            entry->cache.clear();
-            entry->dirty = false;
-
-            if (entry->trapCount <= MirrorEntry::SkipTrapThreshold)
-                ctx.nce.TrapRegions(*entry->trap, true);
-        } else if (auto it{entry->cache.find(blockMapping.data() + blockOffset)}; it != entry->cache.end()) {
-            binary = it->second.binary;
-            hash = it->second.hash;
-            return;
-        }
-
-        // entry->mirror may not be a direct mirror of blockMapping and may just contain it as a subregion, so we need to explicitly calculate the offset
-        span<u8> blockMappingMirror{blockMapping.data() - mirrorBlock.data() + entry->mirror.data(), blockMapping.size()};
-
-        // If nothing was in the cache then do a full shader parse
-        binary.binary = [](span<u8> mapping) {
-            // We attempt to find the shader size by looking for "BRA $" (Infinite Loop) which is used as padding at the end of the shader
-            // UAM Shader Compiler Reference: https://github.com/devkitPro/uam/blob/5a5afc2bae8b55409ab36ba45be63fcb73f68993/source/compiler_iface.cpp#L319-L351
-            constexpr u64 BraSelf1{0xE2400FFFFF87000F}, BraSelf2{0xE2400FFFFF07000F};
-
-            span<u64> shaderInstructions{mapping.cast<u64, std::dynamic_extent, true>()};
-            for (auto it{shaderInstructions.begin()}; it != shaderInstructions.end(); it++) {
-                auto instruction{*it};
-                if (instruction == BraSelf1 || instruction == BraSelf2) [[unlikely]]
-                    // It is far more likely that the instruction doesn't match so this is an unlikely case
-                    return span{shaderInstructions.begin(), it}.cast<u8>();
-            }
-
-            return span<u8>{};
-        }(blockMappingMirror.subspan(blockOffset));
-
-        binary.baseOffset = engine->pipeline.programOffset;
-        hash = XXH64(binary.binary.data(), binary.binary.size_bytes(), 0);
-
-        entry->cache.insert({blockMapping.data() + blockOffset, CacheEntry{binary, hash}});
+        std::tie(binary, hash) = cache.Lookup(ctx, engine->programRegion, engine->pipeline.programOffset);
     }
 
     bool PipelineStageState::Refresh(InterconnectContext &ctx) {
-        if (!trapExecutionLock)
-            trapExecutionLock.emplace(trapMutex);
-
-        if (entry && entry->trapCount > MirrorEntry::SkipTrapThreshold && entry->channelSequenceNumber != ctx.channelCtx.channelSequenceNumber)
-            return true;
-        else if (entry && entry->dirty)
-            return true;
-
-        return false;
+        return cache.Refresh(ctx, engine->programRegion, engine->pipeline.programOffset);
     }
 
     void PipelineStageState::PurgeCaches() {
-        trapExecutionLock.reset();
-    }
-
-    PipelineStageState::~PipelineStageState() {
-        std::scoped_lock lock{trapMutex};
-        //for (const auto &mirror : mirrorMap)
-        //    ctx.nce.DestroyTrap(*mirror.second->trap);
+        cache.PurgeCaches();
     }
 
     /* Vertex Input State */
@@ -500,16 +301,13 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         for (u32 i{}; i < engine::ColorTargetCount; i++) {
             auto ctWrite{[&]() {
-                if (!packedState.activeColorTargets.test(i))
-                    return engine::CtWrite{};
-
                 if (engine->singleCtWriteControl)
                     return engine->ctWrites[0];
                 else
                     return engine->ctWrites[i];
             }()};
 
-            bool enable{engine->blend.enable[i] != 0 && packedState.activeColorTargets.test(i)};
+            bool enable{engine->blend.enable[i] != 0};
 
             if (engine->blendStatePerTargetEnable)
                 packedState.SetAttachmentBlendState(i, enable, ctWrite, engine->blendPerTargets[i]);
@@ -536,7 +334,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
     /* Global Shader Config State */
     void GlobalShaderConfigState::EngineRegisters::DirtyBind(DirtyManager &manager, dirty::Handle handle) const {
-        manager.Bind(handle, postVtgShaderAttributeSkipMask, bindlessTexture, apiMandatedEarlyZ);
+        manager.Bind(handle, postVtgShaderAttributeSkipMask, bindlessTexture, apiMandatedEarlyZ, viewportScaleOffsetEnable);
     }
 
     GlobalShaderConfigState::GlobalShaderConfigState(const EngineRegisters &engine) : engine{engine} {}
@@ -545,6 +343,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         packedState.postVtgShaderAttributeSkipMask = engine.postVtgShaderAttributeSkipMask;
         packedState.bindlessTextureConstantBufferSlotSelect = engine.bindlessTexture.constantBufferSlotSelect;
         packedState.apiMandatedEarlyZ = engine.apiMandatedEarlyZ;
+        packedState.viewportTransformEnable = engine.viewportScaleOffsetEnable;
     }
 
     /* Pipeline State */
@@ -581,6 +380,9 @@ namespace skyline::gpu::interconnect::maxwell3d {
           ctSelect{engine.ctSelect} {}
 
     void PipelineState::Flush(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, StateUpdateBuilder &builder) {
+        packedState.dynamicStateActive = ctx.gpu.traits.supportsExtendedDynamicState;
+        packedState.ctSelect = ctSelect;
+
         std::array<ShaderBinary, engine::PipelineCount> shaderBinaries;
         for (size_t i{}; i < engine::PipelineCount; i++) {
             const auto &stage{pipelineStages[i].UpdateGet(ctx)};
@@ -589,14 +391,16 @@ namespace skyline::gpu::interconnect::maxwell3d {
         }
 
         colorAttachments.clear();
-        packedState.activeColorTargets.reset();
-        for (size_t i{}; i < ctSelect.count; i++) {
-            const auto &view{colorRenderTargets[ctSelect[i]].UpdateGet(ctx, packedState).view.get()};
-            colorAttachments.push_back(view);
-            packedState.activeColorTargets.set(i);
+        for (size_t i{}; i < engine::ColorTargetCount; i++) {
+            if (i < ctSelect.count) {
+                const auto &view{colorRenderTargets[ctSelect[i]].UpdateGet(ctx, packedState).view.get()};
+                colorAttachments.push_back(view);
 
-            if (view)
-                ctx.executor.AttachTexture(view);
+                if (view)
+                    ctx.executor.AttachTexture(view);
+            } else {
+                colorAttachments.push_back({});
+            }
         }
 
         depthAttachment = depthRenderTarget.UpdateGet(ctx, packedState).view.get();
@@ -619,7 +423,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
             }
         }
 
-        auto newPipeline{pipelineManager.FindOrCreate(ctx, textures, constantBuffers, packedState, shaderBinaries, colorAttachments, depthAttachment)};
+        auto newPipeline{ctx.gpu.graphicsPipelineManager->FindOrCreate(ctx, textures, constantBuffers, packedState, shaderBinaries)};
         if (pipeline)
             pipeline->AddTransition(newPipeline);
         pipeline = newPipeline;

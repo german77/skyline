@@ -29,7 +29,7 @@ namespace skyline::service::fssrv {
         auto type{backing->GetEntryType(path)};
 
         if (type) {
-            response.Push(*type);
+            response.Push(static_cast<u32>(*type));
             return {};
         } else {
             response.Push<u32>(0);
@@ -50,6 +50,20 @@ namespace skyline::service::fssrv {
         else
             manager.RegisterService(std::make_shared<IFile>(std::move(file), state, manager), session, response);
 
+        return {};
+    }
+
+    Result IFileSystem::DeleteFile(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        std::string path(request.inputBuf.at(0).as_string(true));
+
+        backing->DeleteFile(path);
+        return {};
+    }
+
+    Result IFileSystem::DeleteDirectory(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        std::string path(request.inputBuf.at(0).as_string(true));
+
+        backing->DeleteDirectory(path);
         return {};
     }
 

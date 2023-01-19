@@ -225,7 +225,7 @@ namespace skyline::gpu {
                 return true; // If the texture is already CPU dirty or we can transition it to being CPU dirty then we don't need to do anything
             }
 
-            if (texture->accumulatedGuestWaitTime > SkipReadbackHackWaitTimeThreshold && *texture->gpu.state.settings->enableTextureReadbackHack) {
+            if (texture->accumulatedGuestWaitTime > SkipReadbackHackWaitTimeThreshold && *texture->gpu.state.settings->enableFastGpuReadbackHack) {
                 texture->dirtyState = DirtyState::Clean;
                 return true;
             }
@@ -480,7 +480,7 @@ namespace skyline::gpu {
                         level.dimensions,
                         guest->format->blockWidth, guest->format->blockHeight, guest->format->bpb,
                         level.blockHeight, level.blockDepth,
-                        outputLevel, inputLevel + (layer * level.linearSize)
+                        inputLevel + (layer * level.linearSize), outputLevel
                     );
 
                     outputLevel += level.blockLinearSize;
@@ -728,7 +728,7 @@ namespace skyline::gpu {
                 // If a texture is Clean then we can just transition it to being GPU dirty and retrap it
                 dirtyState = DirtyState::GpuDirty;
                 gpu.state.nce->TrapRegions(*trapHandle, false);
-                gpu.state.nce->PageOutRegions(*trapHandle);
+                gpu.state.process->memory.FreeMemory(mirror);
                 return;
             } else if (dirtyState != DirtyState::CpuDirty) {
                 return; // If the texture has not been modified on the CPU, there is no need to synchronize it
@@ -756,7 +756,7 @@ namespace skyline::gpu {
             std::scoped_lock lock{stateMutex};
 
             if (dirtyState != DirtyState::CpuDirty && gpuDirty)
-                gpu.state.nce->PageOutRegions(*trapHandle); // All data can be paged out from the guest as the guest mirror won't be used
+                gpu.state.process->memory.FreeMemory(mirror); // All data can be paged out from the guest as the guest mirror won't be used
         }
     }
 
@@ -771,7 +771,7 @@ namespace skyline::gpu {
             if (gpuDirty && dirtyState == DirtyState::Clean) {
                 dirtyState = DirtyState::GpuDirty;
                 gpu.state.nce->TrapRegions(*trapHandle, false);
-                gpu.state.nce->PageOutRegions(*trapHandle);
+                gpu.state.process->memory.FreeMemory(mirror);
                 return;
             } else if (dirtyState != DirtyState::CpuDirty) {
                 return;
@@ -793,7 +793,7 @@ namespace skyline::gpu {
             std::scoped_lock lock{stateMutex};
 
             if (dirtyState != DirtyState::CpuDirty && gpuDirty)
-                gpu.state.nce->PageOutRegions(*trapHandle); // All data can be paged out from the guest as the guest mirror won't be used
+                gpu.state.process->memory.FreeMemory(mirror); // All data can be paged out from the guest as the guest mirror won't be used
         }
     }
 
@@ -825,15 +825,16 @@ namespace skyline::gpu {
         WaitOnBacking();
 
         if (tiling == vk::ImageTiling::eOptimal || !std::holds_alternative<memory::Image>(backing)) {
-            auto stagingBuffer{gpu.memory.AllocateStagingBuffer(surfaceSize)};
+            if (!downloadStagingBuffer)
+                downloadStagingBuffer = gpu.memory.AllocateStagingBuffer(surfaceSize);
 
             WaitOnFence();
             auto lCycle{gpu.scheduler.Submit([&](vk::raii::CommandBuffer &commandBuffer) {
-                CopyIntoStagingBuffer(commandBuffer, stagingBuffer);
+                CopyIntoStagingBuffer(commandBuffer, downloadStagingBuffer);
             })};
             lCycle->Wait(); // We block till the copy is complete
 
-            CopyToGuest(stagingBuffer->data());
+            CopyToGuest(downloadStagingBuffer->data());
         } else if (tiling == vk::ImageTiling::eLinear) {
             // We can optimize linear texture sync on a UMA by mapping the texture onto the CPU and copying directly from it rather than using a staging buffer
             WaitOnFence();

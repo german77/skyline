@@ -7,7 +7,7 @@
 #include <gpu/texture/format.h>
 #include "textures.h"
 
-namespace skyline::gpu::interconnect::maxwell3d {
+namespace skyline::gpu::interconnect {
     void TexturePoolState::EngineRegisters::DirtyBind(DirtyManager &manager, dirty::Handle handle) const {
         manager.Bind(handle, texHeaderPool);
     }
@@ -121,6 +121,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
             TIC_FORMAT_CASE_ST_SRGB(Astc5x5, Astc5x5, Unorm);
             TIC_FORMAT_CASE_ST(Astc6x6, Astc6x6, Unorm);
             TIC_FORMAT_CASE_ST_SRGB(Astc6x6, Astc6x6, Unorm);
+            TIC_FORMAT_CASE_ST(Astc8x6, Astc8x6, Unorm);
+            TIC_FORMAT_CASE_ST_SRGB(Astc8x6, Astc8x6, Unorm);
             TIC_FORMAT_CASE_ST(Astc8x8, Astc8x8, Unorm);
             TIC_FORMAT_CASE_ST_SRGB(Astc8x8, Astc8x8, Unorm);
             TIC_FORMAT_CASE_ST(Astc10x8, Astc10x8, Unorm);
@@ -183,17 +185,52 @@ namespace skyline::gpu::interconnect::maxwell3d {
         };
     }
 
+    static std::shared_ptr<TextureView> CreateNullTexture(InterconnectContext &ctx) {
+        constexpr texture::Format NullImageFormat{format::R8G8B8A8Unorm};
+        constexpr texture::Dimensions NullImageDimensions{1, 1, 1};
+        constexpr vk::ImageLayout NullImageInitialLayout{vk::ImageLayout::eUndefined};
+        constexpr vk::ImageTiling NullImageTiling{vk::ImageTiling::eOptimal};
+        constexpr vk::ImageCreateFlags NullImageFlags{};
+        constexpr vk::ImageUsageFlags NullImageUsage{vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled};
+
+        auto vkImage{ctx.gpu.memory.AllocateImage(
+            {
+                .flags = NullImageFlags,
+                .imageType = vk::ImageType::e2D,
+                .format = NullImageFormat->vkFormat,
+                .extent = NullImageDimensions,
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = NullImageTiling,
+                .usage = NullImageUsage,
+                .sharingMode = vk::SharingMode::eExclusive,
+                .queueFamilyIndexCount = 1,
+                .pQueueFamilyIndices = &ctx.gpu.vkQueueFamilyIndex,
+                .initialLayout = NullImageInitialLayout
+            }
+        )};
+
+        auto nullTexture{std::make_shared<Texture>(ctx.gpu, std::move(vkImage), NullImageDimensions, NullImageFormat, NullImageInitialLayout, NullImageTiling, NullImageFlags, NullImageUsage)};
+        nullTexture->TransitionLayout(vk::ImageLayout::eGeneral);
+        return nullTexture->GetView(vk::ImageViewType::e2D, vk::ImageSubresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1,
+        });;
+    }
+
     TextureView *Textures::GetTexture(InterconnectContext &ctx, u32 index, Shader::TextureType shaderType) {
         auto textureHeaders{texturePool.UpdateGet(ctx).textureHeaders};
         if (textureHeaderCache.size() != textureHeaders.size()) {
             textureHeaderCache.resize(textureHeaders.size());
             std::fill(textureHeaderCache.begin(), textureHeaderCache.end(), CacheEntry{});
         } else if (auto &cached{textureHeaderCache[index]}; cached.view) {
-            if (cached.executionNumber == ctx.executor.executionNumber)
+            if (cached.executionTag == ctx.executor.executionTag)
                 return cached.view;
 
             if (cached.tic == textureHeaders[index] && !cached.view->texture->replaced) {
-                cached.executionNumber = ctx.executor.executionNumber;
+                cached.executionTag = ctx.executor.executionTag;
                 return cached.view;
             }
         }
@@ -207,40 +244,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
             if (auto format{ConvertTicFormat(textureHeader.formatWord, textureHeader.isSrgb)}) {
                 guest.format = format;
             } else {
-                if (!nullTextureView) {
-                    constexpr texture::Format NullImageFormat{format::R8G8B8A8Unorm};
-                    constexpr texture::Dimensions NullImageDimensions{1, 1, 1};
-                    constexpr vk::ImageLayout NullImageInitialLayout{vk::ImageLayout::eUndefined};
-                    constexpr vk::ImageTiling NullImageTiling{vk::ImageTiling::eOptimal};
-                    constexpr vk::ImageCreateFlags NullImageFlags{};
-                    constexpr vk::ImageUsageFlags NullImageUsage{vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled};
-
-                    auto vkImage{ctx.gpu.memory.AllocateImage(
-                        {
-                            .flags = NullImageFlags,
-                            .imageType = vk::ImageType::e2D,
-                            .format = NullImageFormat->vkFormat,
-                            .extent = NullImageDimensions,
-                            .mipLevels = 1,
-                            .arrayLayers = 1,
-                            .samples = vk::SampleCountFlagBits::e1,
-                            .tiling = NullImageTiling,
-                            .usage = NullImageUsage,
-                            .sharingMode = vk::SharingMode::eExclusive,
-                            .queueFamilyIndexCount = 1,
-                            .pQueueFamilyIndices = &ctx.gpu.vkQueueFamilyIndex,
-                            .initialLayout = NullImageInitialLayout
-                        }
-                    )};
-
-                    auto nullTexture{std::make_shared<Texture>(ctx.gpu, std::move(vkImage), NullImageDimensions, NullImageFormat, NullImageInitialLayout, NullImageTiling, NullImageFlags, NullImageUsage)};
-                    nullTexture->TransitionLayout(vk::ImageLayout::eGeneral);
-                    nullTextureView = nullTexture->GetView(vk::ImageViewType::e2D, vk::ImageSubresourceRange{
-                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-                        .levelCount = 1,
-                        .layerCount = 1,
-                    });
-                }
+                if (!nullTextureView)
+                    nullTextureView = CreateNullTexture(ctx);
 
                 return nullTextureView.get();
             }
@@ -317,11 +322,18 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
             auto mappings{ctx.channelCtx.asCtx->gmmu.TranslateRange(textureHeader.Iova(), guest.GetSize())};
             guest.mappings.assign(mappings.begin(), mappings.end());
+            if (guest.mappings.empty() || !guest.mappings.front().valid()) {
+                Logger::Warn("Unmapped texture in pool: 0x{:X}", textureHeader.Iova());
+                if (!nullTextureView)
+                    nullTextureView = CreateNullTexture(ctx);
+
+                return nullTextureView.get();
+            }
 
             texture = ctx.gpu.texture.FindOrCreate(guest, ctx.executor.tag);
         }
 
-        textureHeaderCache[index] = {textureHeader, texture.get(), ctx.executor.executionNumber};
+        textureHeaderCache[index] = {textureHeader, texture.get(), ctx.executor.executionTag};
         return texture.get();
     }
 

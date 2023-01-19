@@ -32,6 +32,10 @@ namespace skyline::gpu {
             .support_float16 = traits.supportsFloat16,
             .support_int64 = traits.supportsInt64,
             .needs_demote_reorder = false,
+            .support_snorm_render_buffer = true,
+            .support_viewport_index_layer = gpu.traits.supportsShaderViewportIndexLayer,
+            .min_ssbo_alignment = traits.minimumStorageBufferAlignment,
+            .support_geometry_passthrough = false
         };
 
         constexpr u32 TegraX1WarpSize{32}; //!< The amount of threads in a warp on the Tegra X1
@@ -62,10 +66,13 @@ namespace skyline::gpu {
             .support_int64_atomics = traits.supportsAtomicInt64,
             .support_derivative_control = true,
             .support_geometry_shader_passthrough = false,
+            .support_native_ndc = false,
             .warp_size_potentially_larger_than_guest = TegraX1WarpSize < traits.subgroupSize,
             .lower_left_origin_mode = false,
             .need_declared_frag_colors = false,
-            .has_broken_spirv_position_input = traits.quirks.brokenSpirvPositionInput
+            .has_broken_spirv_position_input = traits.quirks.brokenSpirvPositionInput,
+            .has_broken_spirv_subgroup_mask_vector_extract_dynamic = traits.quirks.brokenSubgroupMaskExtractDynamic,
+            .has_broken_spirv_subgroup_shuffle = traits.quirks.brokenSubgroupShuffle,
         };
 
         Shader::Settings::values = {
@@ -90,14 +97,21 @@ namespace skyline::gpu {
         span<u8> binary;
         u32 baseOffset;
         u32 textureBufferIndex;
+        bool viewportTransformEnabled;
         ShaderManager::ConstantBufferRead constantBufferRead;
         ShaderManager::GetTextureType getTextureType;
 
       public:
-        std::vector<ShaderManager::ConstantBufferWord> constantBufferWords;
-        std::vector<ShaderManager::CachedTextureType> textureTypes;
-
-        GraphicsEnvironment(const std::array<u32, 8> &postVtgShaderAttributeSkipMask, Shader::Stage pStage, span<u8> pBinary, u32 baseOffset, u32 textureBufferIndex, ShaderManager::ConstantBufferRead constantBufferRead, ShaderManager::GetTextureType getTextureType) : binary{pBinary}, baseOffset{baseOffset}, textureBufferIndex{textureBufferIndex}, constantBufferRead{std::move(constantBufferRead)}, getTextureType{std::move(getTextureType)} {
+        GraphicsEnvironment(const std::array<u32, 8> &postVtgShaderAttributeSkipMask,
+                            Shader::Stage pStage,
+                            span<u8> pBinary, u32 baseOffset,
+                            u32 textureBufferIndex,
+                            bool viewportTransformEnabled,
+                            ShaderManager::ConstantBufferRead constantBufferRead, ShaderManager::GetTextureType getTextureType)
+            : binary{pBinary}, baseOffset{baseOffset},
+              textureBufferIndex{textureBufferIndex},
+              viewportTransformEnabled{viewportTransformEnabled},
+              constantBufferRead{std::move(constantBufferRead)}, getTextureType{std::move(getTextureType)} {
             gp_passthrough_mask = postVtgShaderAttributeSkipMask;
             stage = pStage;
             sph = *reinterpret_cast<Shader::ProgramHeader *>(binary.data());
@@ -112,15 +126,19 @@ namespace skyline::gpu {
         }
 
         [[nodiscard]] u32 ReadCbufValue(u32 index, u32 offset) final {
-            auto value{constantBufferRead(index, offset)};
-            constantBufferWords.emplace_back(index, offset, value);
-            return value;
+            return constantBufferRead(index, offset);
+        }
+
+        [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) final {
+            throw exception("ReadTexturePixelFormat not implemented");
         }
 
         [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) final {
-            auto type{getTextureType(handle)};
-            textureTypes.emplace_back(handle, type);
-            return type;
+            return getTextureType(handle);
+        }
+
+        [[nodiscard]] u32 ReadViewportTransformState() final {
+            return viewportTransformEnabled ? 1 : 0; // Only relevant for graphics shaders
         }
 
         [[nodiscard]] u32 TextureBoundBuffer() const final {
@@ -141,6 +159,82 @@ namespace skyline::gpu {
 
         void Dump(u64 hash) final {}
     };
+
+    /**
+     * @brief A shader environment for all compute pipeline stages
+     */
+    class ComputeEnvironment : public Shader::Environment {
+      private:
+        span<u8> binary;
+        u32 baseOffset;
+        u32 textureBufferIndex;
+        u32 localMemorySize;
+        u32 sharedMemorySize;
+        std::array<u32, 3> workgroupDimensions;
+        ShaderManager::ConstantBufferRead constantBufferRead;
+        ShaderManager::GetTextureType getTextureType;
+
+      public:
+        ComputeEnvironment(span<u8> pBinary,
+                           u32 baseOffset,
+                           u32 textureBufferIndex,
+                           u32 localMemorySize, u32 sharedMemorySize,
+                           std::array<u32, 3> workgroupDimensions,
+                           ShaderManager::ConstantBufferRead constantBufferRead, ShaderManager::GetTextureType getTextureType)
+            : binary{pBinary},
+              baseOffset{baseOffset},
+              textureBufferIndex{textureBufferIndex},
+              localMemorySize{localMemorySize},
+              sharedMemorySize{sharedMemorySize},
+              workgroupDimensions{workgroupDimensions},
+              constantBufferRead{std::move(constantBufferRead)},
+              getTextureType{std::move(getTextureType)} {
+            stage = Shader::Stage::Compute;
+            start_address = baseOffset;
+        }
+
+        [[nodiscard]] u64 ReadInstruction(u32 address) final {
+            address -= baseOffset;
+            if (binary.size() < (address + sizeof(u64)))
+                throw exception("Out of bounds instruction read: 0x{:X}", address);
+            return *reinterpret_cast<u64 *>(binary.data() + address);
+        }
+
+        [[nodiscard]] u32 ReadCbufValue(u32 index, u32 offset) final {
+            return constantBufferRead(index, offset);
+        }
+
+        [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) final {
+            throw exception("ReadTexturePixelFormat not implemented");
+        }
+
+        [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) final {
+            return getTextureType(handle);
+        }
+
+        [[nodiscard]] u32 ReadViewportTransformState() final {
+            return 0; // Only relevant for graphics shaders
+        }
+
+        [[nodiscard]] u32 TextureBoundBuffer() const final {
+            return textureBufferIndex;
+        }
+
+        [[nodiscard]] u32 LocalMemorySize() const final {
+            return localMemorySize;
+        }
+
+        [[nodiscard]] u32 SharedMemorySize() const final {
+            return sharedMemorySize;
+        }
+
+        [[nodiscard]] std::array<u32, 3> WorkgroupSize() const final {
+            return workgroupDimensions;
+        }
+
+        void Dump(u64 hash) final {}
+    };
+
 
     /**
      * @brief A shader environment for VertexB during combination as it only requires the shader header and no higher level context
@@ -164,6 +258,14 @@ namespace skyline::gpu {
             throw exception("Not implemented");
         }
 
+        [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) final {
+            throw exception("Not implemented");
+        }
+
+        [[nodiscard]] u32 ReadViewportTransformState() final {
+            throw exception("Not implemented");
+        }
+
         [[nodiscard]] u32 TextureBoundBuffer() const final {
             throw exception("Not implemented");
         }
@@ -183,14 +285,15 @@ namespace skyline::gpu {
         void Dump(u64 hash) final {}
     };
 
-    constexpr ShaderManager::ConstantBufferWord::ConstantBufferWord(u32 index, u32 offset, u32 value) : index(index), offset(offset), value(value) {}
-
-    constexpr ShaderManager::CachedTextureType::CachedTextureType(u32 handle, Shader::TextureType type) : handle(handle), type(type) {}
-
-    Shader::IR::Program ShaderManager::ParseGraphicsShader(const std::array<u32, 8> &postVtgShaderAttributeSkipMask, Shader::Stage stage, span<u8> binary, u32 baseOffset, u32 textureConstantBufferIndex, const ConstantBufferRead &constantBufferRead, const GetTextureType &getTextureType) {
+    Shader::IR::Program ShaderManager::ParseGraphicsShader(const std::array<u32, 8> &postVtgShaderAttributeSkipMask,
+                                                           Shader::Stage stage,
+                                                           span<u8> binary, u32 baseOffset,
+                                                           u32 textureConstantBufferIndex,
+                                                           bool viewportTransformEnabled,
+                                                           const ConstantBufferRead &constantBufferRead, const GetTextureType &getTextureType) {
         std::scoped_lock lock{poolMutex};
 
-        GraphicsEnvironment environment{postVtgShaderAttributeSkipMask, stage, binary, baseOffset, textureConstantBufferIndex, constantBufferRead, getTextureType};
+        GraphicsEnvironment environment{postVtgShaderAttributeSkipMask, stage, binary, baseOffset, textureConstantBufferIndex, viewportTransformEnabled, constantBufferRead, getTextureType};
         Shader::Maxwell::Flow::CFG cfg{environment, flowBlockPool, Shader::Maxwell::Location{static_cast<u32>(baseOffset + sizeof(Shader::ProgramHeader))}};
         return  Shader::Maxwell::TranslateProgram(instructionPool, blockPool, environment, cfg, hostTranslateInfo);
     }
@@ -202,7 +305,25 @@ namespace skyline::gpu {
         return Shader::Maxwell::MergeDualVertexPrograms(vertexA, vertexB, env);
     }
 
-    vk::ShaderModule ShaderManager::CompileShader(Shader::RuntimeInfo &runtimeInfo, Shader::IR::Program &program, Shader::Backend::Bindings &bindings) {
+    Shader::IR::Program ShaderManager::GenerateGeometryPassthroughShader(Shader::IR::Program &layerSource, Shader::OutputTopology topology) {
+        std::scoped_lock lock{poolMutex};
+
+        return Shader::Maxwell::GenerateGeometryPassthrough(instructionPool, blockPool, hostTranslateInfo, layerSource, topology);
+    }
+
+    Shader::IR::Program ShaderManager::ParseComputeShader(span<u8> binary, u32 baseOffset,
+                                                          u32 textureConstantBufferIndex,
+                                                          u32 localMemorySize, u32 sharedMemorySize,
+                                                          std::array<u32, 3> workgroupDimensions,
+                                                          const ConstantBufferRead &constantBufferRead, const GetTextureType &getTextureType) {
+        std::scoped_lock lock{poolMutex};
+
+        ComputeEnvironment environment{binary, baseOffset, textureConstantBufferIndex, localMemorySize, sharedMemorySize, workgroupDimensions, constantBufferRead, getTextureType};
+        Shader::Maxwell::Flow::CFG cfg{environment, flowBlockPool, Shader::Maxwell::Location{static_cast<u32>(baseOffset)}};
+        return  Shader::Maxwell::TranslateProgram(instructionPool, blockPool, environment, cfg, hostTranslateInfo);
+    }
+
+    vk::ShaderModule ShaderManager::CompileShader(const Shader::RuntimeInfo &runtimeInfo, Shader::IR::Program &program, Shader::Backend::Bindings &bindings) {
         std::scoped_lock lock{poolMutex};
 
         if (program.info.loads.Legacy() || program.info.stores.Legacy())

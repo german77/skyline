@@ -297,6 +297,50 @@ namespace skyline::nce {
         return code;
     }
 
+    constexpr size_t RescaleClockSize{17}; //!< The size of the RescaleClock function in 32-bit ARMv8 instructions
+
+    /**
+     * @brief Writes instructions to rescale the host clock to Tegra X1 levels
+     * @note Output is on stack with the stack pointer offset 32B from the initial point
+     */
+    u32 *WriteRescaleClock(u32 *code) {
+        /* Reserve 32B of stack */
+        /* Save working registers */
+        *code++ = 0xD10083FF; // SUB SP, SP, #32
+        *code++ = 0xA90107E0; // STP X0, X1, [SP, #16]
+
+        /* Load magic constant */
+        *code++ = 0xD28F0860; // MOV X0, #30787
+        *code++ = 0xF2AE3680; // MOVK X0, #29108, LSL #16
+        *code++ = 0xF2CB5880; // MOVK X0, #23236, LSL #32
+        *code++ = 0xF2E14F80; // MOVK X0, #2684, LSL #48
+
+        /* Load clock frequency value */
+        for (const auto &mov : instructions::MoveRegister(registers::X1, util::ClockFrequency))
+            if (mov)
+                *code++ = mov;
+
+        /* Multiply clock frequency by magic constant */
+        *code++ = 0xD345FC21; // LSR X1, X1, #5
+        *code++ = 0x9BC07C21; // UMULH X1, X1, X0
+        *code++ = 0xD347FC21; // LSR X1, X1, #7
+
+        /* Load counter value */
+        *code++ = 0xD53BE040; // MRS X0, CNTVCT_EL0
+
+        /* Rescale counter value */
+        *code++ = 0x9AC10801; // UDIV X1, X0, X1
+        *code++ = 0x8B010421; // ADD X1, X1, X1, LSL #1
+        *code++ = 0xD37AE420; // LSL X0, X1, #6
+
+        /* Store result */
+        /* Restore registers */
+        *code++ = 0xF90003E0; // STR X0, [SP, #0]
+        *code++ = 0xA94107E0; // LDP X0, X1, [SP, #16]
+
+        return code;
+    }
+
     constexpr u32 TpidrEl0{0x5E82};         // ID of TPIDR_EL0 in MRS
     constexpr u32 TpidrroEl0{0x5E83};       // ID of TPIDRRO_EL0 in MRS
     constexpr u32 CntfrqEl0{0x5F00};        // ID of CNTFRQ_EL0 in MRS
@@ -308,9 +352,7 @@ namespace skyline::nce {
         size_t size{guest::SaveCtxSize + guest::LoadCtxSize + TrampolineSize};
         std::vector<size_t> offsets;
 
-        u64 frequency;
-        asm("MRS %0, CNTFRQ_EL0" : "=r"(frequency));
-        bool rescaleClock{frequency != TegraX1Freq};
+        bool rescaleClock{util::ClockFrequency != TegraX1Freq};
 
         auto start{reinterpret_cast<const u32 *>(text.data())}, end{reinterpret_cast<const u32 *>(text.data() + text.size())};
         for (const u32 *instruction{start}; instruction < end; instruction++) {
@@ -329,7 +371,7 @@ namespace skyline::nce {
                 } else {
                     if (rescaleClock) {
                         if (mrs.srcReg == CntpctEl0) {
-                            size += guest::RescaleClockSize + 3;
+                            size += RescaleClockSize + 3;
                             offsets.push_back(instructionOffset);
                         } else if (mrs.srcReg == CntfrqEl0) {
                             size += 3;
@@ -359,9 +401,7 @@ namespace skyline::nce {
         std::memcpy(patch, reinterpret_cast<void *>(&guest::LoadCtx), guest::LoadCtxSize * sizeof(u32));
         patch += guest::LoadCtxSize;
 
-        u64 frequency;
-        asm("MRS %0, CNTFRQ_EL0" : "=r"(frequency));
-        bool rescaleClock{frequency != TegraX1Freq};
+        bool rescaleClock{util::ClockFrequency != TegraX1Freq};
 
         for (auto offset : offsets) {
             u32 *instruction{reinterpret_cast<u32 *>(text.data()) + offset};
@@ -424,8 +464,7 @@ namespace skyline::nce {
                             *instruction = instructions::B(static_cast<i32>(endOffset() + offset), true).raw;
 
                             /* Rescale host clock */
-                            std::memcpy(patch, reinterpret_cast<void *>(&guest::RescaleClock), guest::RescaleClockSize * sizeof(u32));
-                            patch += guest::RescaleClockSize;
+                            patch = WriteRescaleClock(patch);
 
                             /* Load result from stack into destination register */
                             instructions::Ldr ldr(0xF94003E0); // LDR XOUT, [SP]
@@ -476,6 +515,9 @@ namespace skyline::nce {
     }
 
     size_t NCE::GetHookSectionSize(span<HookedSymbolEntry> entries) {
+        if (entries.empty())
+            return 0;
+
         size_t size{guest::SaveCtxSize + guest::LoadCtxSize + TrampolineSize};
         for (const auto &entry : entries) {
             constexpr size_t EmitTrampolineSize{10};
@@ -695,19 +737,6 @@ namespace skyline::nce {
         auto protection{writeOnly ? TrapProtection::WriteOnly : TrapProtection::ReadWrite};
         handle->value.protection = protection;
         ReprotectIntervals(handle->intervals, protection);
-    }
-
-    void NCE::PageOutRegions(TrapHandle handle) {
-        TRACE_EVENT("host", "NCE::PageOutRegions");
-        std::scoped_lock lock{trapMutex};
-        for (auto region : handle->intervals) {
-            auto freeStart{util::AlignUp(region.start, constant::PageSize)}, freeEnd{util::AlignDown(region.end, constant::PageSize)}; // We want to avoid the first and last page as they may contain unrelated data
-            ssize_t freeSize{freeEnd - freeStart};
-
-            constexpr ssize_t MinimumPageoutSize{constant::PageSize}; //!< The minimum size to page out, we don't want to page out small intervals for performance reasons
-            if (freeSize > MinimumPageoutSize)
-                state.process->memory.FreeMemory(span<u8>{freeStart, static_cast<size_t>(freeSize)});
-        }
     }
 
     void NCE::RemoveTrap(TrapHandle handle) {

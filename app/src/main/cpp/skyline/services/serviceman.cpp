@@ -54,6 +54,7 @@
 #include "capsrv/IAlbumApplicationService.h"
 #include "capsrv/IScreenShotApplicationService.h"
 #include "ro/IRoInterface.h"
+#include "mii/IStaticService.h"
 #include "serviceman.h"
 
 #define SERVICE_CASE(class, name, ...) \
@@ -126,6 +127,7 @@ namespace skyline::service {
             SERVICE_CASE(spl::IRandomInterface, "csrng")
             SERVICE_CASE(ssl::ISslService, "ssl")
             SERVICE_CASE(prepo::IPrepoService, "prepo:u")
+            SERVICE_CASE(prepo::IPrepoService, "prepo:a")
             SERVICE_CASE(mmnv::IRequest, "mm:u")
             SERVICE_CASE(bcat::IServiceCreator, "bcat:u")
             SERVICE_CASE(bt::IBluetoothUser, "bt")
@@ -136,6 +138,8 @@ namespace skyline::service {
             SERVICE_CASE(capsrv::IScreenShotApplicationService, "caps:su")
             SERVICE_CASE(nim::IShopServiceAccessServerInterface, "nim:eca")
             SERVICE_CASE(ro::IRoInterface, "ldr:ro")
+            SERVICE_CASE(mii::IStaticService, "mii:e")
+            SERVICE_CASE(mii::IStaticService, "mii:u")
             default:
                 std::string_view nameString(span(reinterpret_cast<char *>(&name), sizeof(name)).as_string(true));
                 throw std::out_of_range(fmt::format("CreateService called with an unknown service name: {}", nameString));

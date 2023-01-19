@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright © 2020 Skyline Team and Contributors (https://github.com/skyline-emu/)
 
+#include <os.h>
+#include <vfs/os_backing.h>
+#include <fcntl.h>
 #include <common/settings.h>
 #include "IProfile.h"
 
@@ -37,5 +40,31 @@ namespace skyline::service::account {
         response.Push(accountProfileBase);
 
         return {};
+    }
+
+    Result IProfile::GetImageSize(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        std::shared_ptr<vfs::Backing> profileImageIcon{GetProfilePicture()};
+        response.Push(static_cast<u32>(profileImageIcon->size));
+
+        return {};
+    }
+
+    Result IProfile::LoadImage(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        std::shared_ptr<vfs::Backing> profileImageIcon{GetProfilePicture()};
+
+        profileImageIcon->Read(span(request.outputBuf.at(0)).first(profileImageIcon->size), 0);
+        response.Push(static_cast<u32>(profileImageIcon->size));
+
+        return {};
+    }
+
+    std::shared_ptr<vfs::Backing> IProfile::GetProfilePicture() {
+        std::string profilePicturePath{*state.settings->profilePictureValue};
+        int fd{open((profilePicturePath).c_str(), O_RDONLY)};
+        if (fd < 0)
+            // If we can't find the profile picture then just return the placeholder profile picture
+            return state.os->assetFileSystem->OpenFile("profile_picture.jpeg");
+        else
+            return std::make_shared<vfs::OsBacking>(fd, true);
     }
 }

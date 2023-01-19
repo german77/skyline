@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright © 2021 Skyline Team and Contributors (https://github.com/skyline-emu/)
 
+#include <condition_variable>
+#include <mutex>
 #include <range/v3/view.hpp>
+#include <adrenotools/driver.h>
 #include <common/settings.h>
 #include <loader/loader.h>
 #include <gpu.h>
 #include <dlfcn.h>
 #include "command_executor.h"
+#include <nce.h>
 
 namespace skyline::gpu::interconnect {
     CommandRecordThread::CommandRecordThread(const DeviceState &state)
         : state{state},
-          incoming{*state.settings->executorSlotCount},
-          outgoing{*state.settings->executorSlotCount},
+          incoming{1U << *state.settings->executorSlotCountScale},
+          outgoing{1U << *state.settings->executorSlotCountScale},
           thread{&CommandRecordThread::Run, this} {}
 
     CommandRecordThread::Slot::ScopedBegin::ScopedBegin(CommandRecordThread::Slot &slot) : slot{slot} {}
@@ -54,8 +58,13 @@ namespace skyline::gpu::interconnect {
           ready{other.ready} {}
 
     std::shared_ptr<FenceCycle> CommandRecordThread::Slot::Reset(GPU &gpu) {
+        auto startTime{util::GetTimeNs()};
+
         cycle->Wait();
         cycle = std::make_shared<FenceCycle>(*cycle);
+        if (util::GetTimeNs() - startTime > GrowThresholdNs)
+            didWait = true;
+
         // Command buffer doesn't need to be reset since that's done implicitly by begin
         return cycle;
     }
@@ -76,7 +85,7 @@ namespace skyline::gpu::interconnect {
     }
 
     void CommandRecordThread::ProcessSlot(Slot *slot) {
-        TRACE_EVENT_FMT("gpu", "ProcessSlot: 0x{:X}, execution: {}", slot, slot->executionNumber);
+        TRACE_EVENT_FMT("gpu", "ProcessSlot: 0x{:X}, execution: {}", slot, slot->executionTag);
         auto &gpu{*state.gpu};
 
         vk::RenderPass lRenderPass;
@@ -125,10 +134,7 @@ namespace skyline::gpu::interconnect {
                 Logger::Warn("Failed to intialise RenderDoc API: {}", ret);
         }
 
-        std::vector<Slot> slots{};
-        std::generate_n(std::back_inserter(slots), *state.settings->executorSlotCount, [&] () -> Slot { return gpu; });
-
-        outgoing.AppendTranform(span<Slot>(slots), [](auto &slot) { return &slot; });
+        outgoing.Push(&slots.emplace_back(gpu));
 
         if (int result{pthread_setname_np(pthread_self(), "Sky-CmdRecord")})
             Logger::Warn("Failed to set the thread name: {}", strerror(result));
@@ -137,6 +143,7 @@ namespace skyline::gpu::interconnect {
             signal::SetSignalHandler({SIGINT, SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV}, signal::ExceptionalSignalHandler);
 
             incoming.Process([this, renderDocApi, &gpu](Slot *slot) {
+                idle = false;
                 VkInstance instance{*gpu.vkInstance};
                 if (renderDocApi && slot->capture)
                     renderDocApi->StartFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), nullptr);
@@ -147,7 +154,14 @@ namespace skyline::gpu::interconnect {
                     renderDocApi->EndFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance), nullptr);
                 slot->capture = false;
 
+                if (slot->didWait && (slots.size() + 1) < (1U << *state.settings->executorSlotCountScale)) {
+                    outgoing.Push(&slots.emplace_back(gpu));
+                    outgoing.Push(&slots.emplace_back(gpu));
+                    slot->didWait = false;
+                }
+
                 outgoing.Push(slot);
+                idle = true;
             }, [] {});
         } catch (const signal::SignalException &e) {
             Logger::Error("{}\nStack Trace:{}", e.what(), state.loader->GetStackTrace(e.frames));
@@ -164,18 +178,80 @@ namespace skyline::gpu::interconnect {
         }
     }
 
+    bool CommandRecordThread::IsIdle() const {
+        return idle;
+    }
+
     CommandRecordThread::Slot *CommandRecordThread::AcquireSlot() {
-        return outgoing.Pop();
+        auto startTime{util::GetTimeNs()};
+        auto slot{outgoing.Pop()};
+        if (util::GetTimeNs() - startTime > GrowThresholdNs)
+            slot->didWait = true;
+
+        return slot;
     }
 
     void CommandRecordThread::ReleaseSlot(Slot *slot) {
         incoming.Push(slot);
     }
 
+    void ExecutionWaiterThread::Run() {
+        signal::SetSignalHandler({SIGSEGV}, nce::NCE::HostSignalHandler); // We may access NCE trapped memory
+
+        // Enable turbo clocks to begin with if requested
+        if (*state.settings->forceMaxGpuClocks)
+            adrenotools_set_turbo(true);
+
+        while (true) {
+            std::pair<std::shared_ptr<FenceCycle>, std::function<void()>> item{};
+            {
+                std::unique_lock lock{mutex};
+                if (pendingSignalQueue.empty()) {
+                    idle = true;
+
+                    // Don't force turbo clocks when the GPU is idle
+                    if (*state.settings->forceMaxGpuClocks)
+                        adrenotools_set_turbo(false);
+
+                    condition.wait(lock, [this] { return !pendingSignalQueue.empty(); });
+
+                    // Once we have work to do, force turbo clocks is enabled
+                    if (*state.settings->forceMaxGpuClocks)
+                        adrenotools_set_turbo(true);
+
+                    idle = false;
+                }
+                item = std::move(pendingSignalQueue.front());
+                pendingSignalQueue.pop();
+            }
+            {
+                TRACE_EVENT("gpu", "GPU");
+                if (item.first)
+                    item.first->Wait();
+            }
+
+            if (item.second)
+                item.second();
+        }
+    }
+
+    ExecutionWaiterThread::ExecutionWaiterThread(const DeviceState &state) : state{state}, thread{&ExecutionWaiterThread::Run, this} {}
+
+    bool ExecutionWaiterThread::IsIdle() const {
+        return idle;
+    }
+
+    void ExecutionWaiterThread::Queue(std::shared_ptr<FenceCycle> cycle, std::function<void()> &&callback) {
+        std::unique_lock lock{mutex};
+        pendingSignalQueue.push({std::move(cycle), std::move(callback)});
+        condition.notify_all();
+    }
+
     CommandExecutor::CommandExecutor(const DeviceState &state)
         : state{state},
           gpu{*state.gpu},
           recordThread{state},
+          waiterThread{state},
           tag{AllocateTag()} {
         RotateRecordSlot();
     }
@@ -193,7 +269,7 @@ namespace skyline::gpu::interconnect {
         captureNextExecution = false;
         slot = recordThread.AcquireSlot();
         cycle = slot->Reset(gpu);
-        slot->executionNumber = executionNumber;
+        slot->executionTag = executionTag;
         allocator = &slot->allocator;
     }
 
@@ -353,6 +429,9 @@ namespace skyline::gpu::interconnect {
             slot->nodes.emplace_back(std::in_place_type_t<node::NextSubpassFunctionNode>(), std::forward<decltype(function)>(function));
         else
             slot->nodes.emplace_back(std::in_place_type_t<node::SubpassFunctionNode>(), std::forward<decltype(function)>(function));
+
+        if (slot->nodes.size() > *state.settings->executorFlushThreshold && !gotoNext)
+            Submit();
     }
 
     void CommandExecutor::AddOutsideRpCommand(std::function<void(vk::raii::CommandBuffer &, const std::shared_ptr<FenceCycle> &, GPU &)> &&function) {
@@ -472,25 +551,53 @@ namespace skyline::gpu::interconnect {
         renderPassIndex = 0;
 
         // Periodically clear preserve attachments just in case there are new waiters which would otherwise end up waiting forever
-        if ((submissionNumber % (*state.settings->executorSlotCount * 2)) == 0) {
+        if ((submissionNumber % (2U << *state.settings->executorSlotCountScale)) == 0) {
             preserveAttachedBuffers.clear();
             preserveAttachedTextures.clear();
         }
     }
 
-    void CommandExecutor::Submit() {
-        for (const auto &callback : flushCallbacks)
-            callback();
+    void CommandExecutor::Submit(std::function<void()> &&callback, bool wait) {
+        for (const auto &flushCallback : flushCallbacks)
+            flushCallback();
 
-        executionNumber++;
+        executionTag = AllocateTag();
 
         if (!slot->nodes.empty()) {
             TRACE_EVENT("gpu", "CommandExecutor::Submit");
+
+            if (callback && *state.settings->useDirectMemoryImport)
+                waiterThread.Queue(cycle, std::move(callback));
+            else
+                waiterThread.Queue(cycle, {});
+
             SubmitInternal();
             submissionNumber++;
+
+        } else {
+            if (callback && *state.settings->useDirectMemoryImport)
+                waiterThread.Queue(nullptr, std::move(callback));
         }
 
+        if (callback && !*state.settings->useDirectMemoryImport)
+            callback();
+
         ResetInternal();
+
+        if (wait) {
+            std::condition_variable cv;
+            std::mutex mutex;
+            bool gpuDone{};
+
+            waiterThread.Queue(nullptr, [&cv, &mutex, &gpuDone] {
+                std::scoped_lock lock{mutex};
+                gpuDone = true;
+                cv.notify_one();
+            });
+
+            std::unique_lock lock{mutex};
+            cv.wait(lock, [&gpuDone] { return gpuDone; });
+        }
     }
 
     void CommandExecutor::LockPreserve() {

@@ -70,6 +70,9 @@
             app:key="username_value"
             app:limit="31"
             app:title="@string/username" />
+        <emu.skyline.preference.ProfilePicturePreference
+            app:key="profile_picture_value"
+            app:title="@string/profile_picture" />
         <emu.skyline.preference.IntegerListPreference
             android:defaultValue="1"
             android:entries="@array/system_languages"
@@ -129,18 +132,51 @@
             app:title="@string/respect_display_cutout" />
         <SeekBarPreference
             android:min="1"
-            android:defaultValue="6"
-            android:max="16"
-            android:summary="@string/executor_slot_count_desc"
-            app:key="executor_slot_count"
-            app:title="@string/executor_slot_count"
+            android:defaultValue="4"
+            android:max="6"
+            android:summary="@string/executor_slot_count_scale_desc"
+            app:key="executor_slot_count_scale"
+            app:title="@string/executor_slot_count_scale"
+            app:showSeekBarValue="true" />
+        <SeekBarPreference
+            android:min="0"
+            android:defaultValue="256"
+            android:max="1024"
+            android:summary="@string/executor_flush_threshold_desc"
+            app:key="executor_flush_threshold"
+            app:title="@string/executor_flush_threshold"
             app:showSeekBarValue="true" />
         <CheckBoxPreference
             android:defaultValue="false"
-            android:summaryOff="@string/enable_texture_readback_hack_disabled"
-            android:summaryOn="@string/enable_texture_readback_hack_enabled"
-            app:key="enable_texture_readback_hack"
-            app:title="@string/enable_texture_readback_hack" />
+            android:summary="@string/use_direct_memory_import_desc"
+            app:key="use_direct_memory_import"
+            app:title="@string/use_direct_memory_import" />
+        <CheckBoxPreference
+            android:defaultValue="false"
+            android:summary="@string/force_max_gpu_clocks_desc"
+            app:key="force_max_gpu_clocks"
+            app:title="@string/force_max_gpu_clocks" />
+    </PreferenceCategory>
+    <PreferenceCategory
+        android:key="category_hacks"
+        android:title="@string/hacks">
+        <CheckBoxPreference
+            android:defaultValue="false"
+            android:summaryOff="@string/enable_fast_gpu_readback_disabled"
+            android:summaryOn="@string/enable_fast_gpu_readback_enabled"
+            app:key="enable_fast_gpu_readback_hack"
+            app:title="@string/enable_fast_gpu_readback" />
+    </PreferenceCategory>
+    <PreferenceCategory
+        android:key="category_audio"
+        android:title="@string/audio"
+        app:isPreferenceVisible="true">
+        <CheckBoxPreference
+            android:defaultValue="false"
+            android:summaryOff="@string/disable_audio_output_disabled"
+            android:summaryOn="@string/disable_audio_output_enabled"
+            app:key="is_audio_output_disabled"
+            app:title="@string/disable_audio_output" />
     </PreferenceCategory>
     <PreferenceCategory
         android:key="category_debug"

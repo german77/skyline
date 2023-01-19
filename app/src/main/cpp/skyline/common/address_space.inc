@@ -238,16 +238,7 @@ namespace skyline {
         u8 *blockPhys{predecessor->phys + (virt - predecessor->virt)};
         VaType blockSize{std::min(successor->virt - virt, size)};
 
-
         while (size) {
-            // Return a zeroed out map to emulate sparse mappings
-            if (predecessor->extraInfo.sparseMapped) {
-                if (blockSize > SparseMapSize)
-                    throw exception("Size of the sparse map is too small to fit block of size: 0x{:X}", blockSize);
-
-                blockPhys = sparseMap;
-            }
-
             if (predecessor->phys) {
                 span cpuBlock{blockPhys, blockSize};
                 if (cpuAccessCallback)
@@ -287,7 +278,7 @@ namespace skyline {
     MM_MEMBER(void)::Read(u8 *destination, VaType virt, VaType size, std::function<void(span<u8>)> cpuAccessCallback) {
         TRACE_EVENT("containers", "FlatMemoryManager::Read");
 
-        std::scoped_lock lock(this->blockMutex);
+        std::shared_lock lock(this->blockMutex);
 
         auto successor{std::upper_bound(this->blocks.begin(), this->blocks.end(), virt, [] (auto virt, const auto &block) {
             return virt < block.virt;
@@ -327,7 +318,7 @@ namespace skyline {
     MM_MEMBER(void)::Write(VaType virt, u8 *source, VaType size, std::function<void(span<u8>)> cpuAccessCallback) {
         TRACE_EVENT("containers", "FlatMemoryManager::Write");
 
-        std::scoped_lock lock(this->blockMutex);
+        std::shared_lock lock(this->blockMutex);
 
         VaType virtEnd{virt + size};
 
@@ -367,7 +358,7 @@ namespace skyline {
     MM_MEMBER(void)::Copy(VaType dst, VaType src, VaType size, std::function<void(span<u8>)> cpuAccessCallback) {
         TRACE_EVENT("containers", "FlatMemoryManager::Copy");
 
-        std::scoped_lock lock(this->blockMutex);
+        std::shared_lock lock(this->blockMutex);
 
         VaType srcEnd{src + size};
         VaType dstEnd{dst + size};

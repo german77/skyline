@@ -213,13 +213,17 @@ namespace skyline::gpu {
     }
 
     static vk::raii::PhysicalDevice CreatePhysicalDevice(const vk::raii::Instance &instance) {
-        return std::move(vk::raii::PhysicalDevices(instance).front()); // We just select the first device as we aren't expecting multiple GPUs
+        auto devices{vk::raii::PhysicalDevices(instance)};
+        if (devices.empty())
+            throw exception("No Vulkan physical devices found");
+        return std::move(devices.front()); // We just select the first device as we aren't expecting multiple GPUs
     }
 
     static vk::raii::Device CreateDevice(const vk::raii::Context &context,
                                          const vk::raii::PhysicalDevice &physicalDevice,
                                          decltype(vk::DeviceQueueCreateInfo::queueCount) &vkQueueFamilyIndex,
-                                         TraitManager &traits) {
+                                         TraitManager &traits,
+                                         adrenotools_gpu_mapping *mapping) {
         auto deviceFeatures2{physicalDevice.getFeatures2<
             vk::PhysicalDeviceFeatures2,
             vk::PhysicalDeviceCustomBorderColorFeaturesEXT,
@@ -233,7 +237,9 @@ namespace skyline::gpu {
             vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
             vk::PhysicalDeviceImagelessFramebufferFeatures,
             vk::PhysicalDeviceTransformFeedbackFeaturesEXT,
-            vk::PhysicalDeviceIndexTypeUint8FeaturesEXT>()};
+            vk::PhysicalDeviceIndexTypeUint8FeaturesEXT,
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT,
+            vk::PhysicalDeviceRobustness2FeaturesEXT>()};
         decltype(deviceFeatures2) enabledFeatures2{}; // We only want to enable features we required due to potential overhead from unused features
 
         #define FEAT_REQ(structName, feature)                                            \
@@ -272,7 +278,7 @@ namespace skyline::gpu {
             vk::PhysicalDeviceSubgroupProperties>()};
 
         traits = TraitManager{deviceFeatures2, enabledFeatures2, deviceExtensions, enabledExtensions, deviceProperties2, physicalDevice};
-        traits.ApplyDriverPatches(context);
+        traits.ApplyDriverPatches(context, mapping);
 
         std::vector<const char *> pEnabledExtensions;
         pEnabledExtensions.reserve(enabledExtensions.size());
@@ -333,19 +339,20 @@ namespace skyline::gpu {
         });
     }
 
-    static PFN_vkGetInstanceProcAddr LoadVulkanDriver(const DeviceState &state) {
+    static PFN_vkGetInstanceProcAddr LoadVulkanDriver(const DeviceState &state, adrenotools_gpu_mapping *mapping) {
         void *libvulkanHandle{};
 
         // If the user has selected a custom driver, try to load it
         if (!(*state.settings->gpuDriver).empty()) {
             libvulkanHandle = adrenotools_open_libvulkan(
                 RTLD_NOW,
-                ADRENOTOOLS_DRIVER_FILE_REDIRECT | ADRENOTOOLS_DRIVER_CUSTOM,
+                ADRENOTOOLS_DRIVER_FILE_REDIRECT | ADRENOTOOLS_DRIVER_CUSTOM | ADRENOTOOLS_DRIVER_GPU_MAPPING_IMPORT,
                 nullptr, // We require Android 10 so don't need to supply
                 state.os->nativeLibraryPath.c_str(),
                 (state.os->privateAppFilesPath + "gpu_drivers/" + *state.settings->gpuDriver + "/").c_str(),
                 (*state.settings->gpuDriverLibraryName).c_str(),
-                (state.os->publicAppFilesPath + "gpu/vk_file_redirect/").c_str()
+                (state.os->publicAppFilesPath + "gpu/vk_file_redirect/").c_str(),
+                mapping
             );
 
             if (!libvulkanHandle) {
@@ -354,19 +361,37 @@ namespace skyline::gpu {
             }
         }
 
-        if (!libvulkanHandle)
-            libvulkanHandle = dlopen("libvulkan.so", RTLD_NOW);
+        if (!libvulkanHandle) {
+            libvulkanHandle = adrenotools_open_libvulkan(
+                RTLD_NOW,
+                ADRENOTOOLS_DRIVER_FILE_REDIRECT | ADRENOTOOLS_DRIVER_GPU_MAPPING_IMPORT,
+                nullptr, // We require Android 10 so don't need to supply
+                state.os->nativeLibraryPath.c_str(),
+                nullptr,
+                nullptr,
+                (state.os->publicAppFilesPath + "gpu/vk_file_redirect/").c_str(),
+                mapping
+            );
+
+            if (!libvulkanHandle) {
+                char *error = dlerror();
+                Logger::Warn("Failed to load builtin Vulkan driver: {}", error ? error : "");
+            }
+
+            if (!libvulkanHandle)
+                libvulkanHandle = dlopen("libvulkan.so", RTLD_NOW);
+        }
 
         return reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(libvulkanHandle, "vkGetInstanceProcAddr"));
     }
 
     GPU::GPU(const DeviceState &state)
         : state(state),
-          vkContext(LoadVulkanDriver(state)),
+          vkContext(LoadVulkanDriver(state, &adrenotoolsImportMapping)),
           vkInstance(CreateInstance(state, vkContext)),
           vkDebugReportCallback(CreateDebugReportCallback(this, vkInstance)),
           vkPhysicalDevice(CreatePhysicalDevice(vkInstance)),
-          vkDevice(CreateDevice(vkContext, vkPhysicalDevice, vkQueueFamilyIndex, traits)),
+          vkDevice(CreateDevice(vkContext, vkPhysicalDevice, vkQueueFamilyIndex, traits, &adrenotoolsImportMapping)),
           vkQueue(vkDevice, vkQueueFamilyIndex, 0),
           memory(*this),
           scheduler(state, *this),
@@ -380,4 +405,9 @@ namespace skyline::gpu {
           graphicsPipelineCache(*this),
           renderPassCache(*this),
           framebufferCache(*this) {}
+
+    void GPU::Initialise() {
+        graphicsPipelineCacheManager.emplace(state, state.os->publicAppFilesPath + "graphics_pipeline_cache/" + state.loader->nacp->GetSaveDataOwnerId());
+        graphicsPipelineManager.emplace(*this);
+    }
 }

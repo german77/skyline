@@ -28,9 +28,27 @@ namespace skyline::service::account {
          */
         Result GetBase(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
+        /**
+         * @url https://switchbrew.org/wiki/Account_services#GetImageSize
+         */
+        Result GetImageSize(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
+        /**
+         * @url https://switchbrew.org/wiki/Account_services#LoadImage
+         */
+        Result LoadImage(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
+        /**
+         * @brief Tries to get the user's profile picture. If not found, returns the default one
+         * @return A shared pointer to a Backing object of the profile picture
+         */
+        std::shared_ptr<vfs::Backing> GetProfilePicture();
+
         SERVICE_DECL(
             SFUNC(0x0, IProfile, Get),
-            SFUNC(0x1, IProfile, GetBase)
+            SFUNC(0x1, IProfile, GetBase),
+            SFUNC(0xA, IProfile, GetImageSize),
+            SFUNC(0xB, IProfile, LoadImage)
         )
     };
 }

@@ -39,9 +39,10 @@ namespace skyline::gpu::interconnect {
             LinearAllocatorState<> allocator;
             std::mutex beginLock;
             std::condition_variable beginCondition;
-            u32 executionNumber;
+            ContextTag executionTag;
             bool ready{}; //!< If this slot's command buffer has had 'beginCommandBuffer' called and is ready to have commands recorded into it
             bool capture{}; //!< If this slot's Vulkan commands should be captured using the renderdoc API
+            bool didWait{}; //!< If a wait of time longer than GrowThresholdNs occured when this slot was acquired
 
             Slot(GPU &gpu);
 
@@ -62,9 +63,12 @@ namespace skyline::gpu::interconnect {
         };
 
       private:
+        static constexpr size_t GrowThresholdNs{constant::NsInMillisecond / 50}; //!< The wait time threshold at which the slot count will be increased
         const DeviceState &state;
         CircularQueue<Slot *> incoming; //!< Slots pending recording
         CircularQueue<Slot *> outgoing; //!< Slots that have been submitted, may still be active on the GPU
+        std::list<Slot> slots;
+        std::atomic<bool> idle;
 
         std::thread thread;
 
@@ -74,6 +78,8 @@ namespace skyline::gpu::interconnect {
 
       public:
         CommandRecordThread(const DeviceState &state);
+
+        bool IsIdle() const;
 
         /**
          * @return A free slot, `Reset` needs to be called before accessing it
@@ -87,6 +93,31 @@ namespace skyline::gpu::interconnect {
     };
 
     /**
+     * @brief Thread responsible for notifying the guest of the completion of GPU operations
+     */
+    class ExecutionWaiterThread {
+      private:
+        const DeviceState &state;
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::queue<std::pair<std::shared_ptr<FenceCycle>, std::function<void()>>> pendingSignalQueue; //!< Queue of callbacks to be executed when their coressponding fence is signalled
+        std::atomic<bool> idle{};
+
+        void Run();
+
+      public:
+        ExecutionWaiterThread(const DeviceState &state);
+
+        bool IsIdle() const;
+
+        /**
+         * @brief Queues `callback` to be executed when `cycle` is signalled, null values are valid for either, will null cycle representing an immediate callback (dep on previously queued cycles) and null callback representing a wait with no callback
+         */
+        void Queue(std::shared_ptr<FenceCycle> cycle, std::function<void()> &&callback);
+    };
+
+    /**
      * @brief Assembles a Vulkan command stream with various nodes and manages execution of the produced graph
      * @note This class is **NOT** thread-safe and should **ONLY** be utilized by a single thread
      */
@@ -96,6 +127,7 @@ namespace skyline::gpu::interconnect {
         GPU &gpu;
         CommandRecordThread recordThread;
         CommandRecordThread::Slot *slot{};
+        ExecutionWaiterThread waiterThread;
         node::RenderPassNode *renderPass{};
         size_t subpassCount{}; //!< The number of subpasses in the current render pass
         u32 renderPassIndex{};
@@ -183,7 +215,7 @@ namespace skyline::gpu::interconnect {
         LinearAllocatorState<> *allocator;
         ContextTag tag; //!< The tag associated with this command executor, any tagged resource locking must utilize this tag
         size_t submissionNumber{};
-        u32 executionNumber{};
+        ContextTag executionTag{};
         bool captureNextExecution{};
 
         CommandExecutor(const DeviceState &state);
@@ -268,8 +300,10 @@ namespace skyline::gpu::interconnect {
 
         /**
          * @brief Execute all the nodes and submit the resulting command buffer to the GPU
+         * @param callback A function to call upon GPU completion of the submission
+         * @param wait Whether to wait synchronously for GPU completion of the submit
          */
-        void Submit();
+        void Submit(std::function<void()> &&callback = {}, bool wait = false);
 
         /**
          * @brief Locks all preserve attached buffers/textures

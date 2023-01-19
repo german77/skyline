@@ -4,6 +4,7 @@
 #pragma once
 
 #include <tuple>
+#include <gpu/texture/format.h>
 #include <shader_compiler/runtime_info.h>
 #include "common.h"
 
@@ -14,6 +15,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
     /**
      * @brief Packed struct of pipeline state suitable for use as a map key
      * @note This is heavily based around yuzu's pipeline key with some packing modifications
+     * @note Any modifications to this struct *MUST* be accompanied by a pipeline cache version bump
      * @url https://github.com/yuzu-emu/yuzu/blob/9c701774562ea490296b9cbea3dbd8c096bc4483/src/video_core/renderer_vulkan/fixed_pipeline_state.h#L20
      */
     struct PackedPipelineState {
@@ -58,6 +60,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
             u8 alphaFunc : 3; //!< Use {Set,Get}AlphaFunc
             bool alphaTestEnable : 1;
             bool depthClampEnable : 1; // Use SetDepthClampEnable
+            bool dynamicStateActive : 1;
+            bool viewportTransformEnable : 1;
         };
 
         u32 patchSize;
@@ -65,14 +69,12 @@ namespace skyline::gpu::interconnect::maxwell3d {
         float pointSize;
         std::array<engine::VertexAttribute, engine::VertexAttributeCount> vertexAttributes;
         std::array<u8, engine::ColorTargetCount> colorRenderTargetFormats; //!< Use {Set, Get}ColorRenderTargetFormat
-        std::bitset<8> activeColorTargets;
+        engine::CtSelect ctSelect;
         std::array<u32, 8> postVtgShaderAttributeSkipMask;
 
         struct VertexBinding {
-            u16 stride : 12;
             u8 inputRate : 1;
             bool enable : 1;
-            u8 _pad_ : 2;
             u32 divisor;
 
             vk::VertexInputRate GetInputRate() const {
@@ -95,6 +97,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         std::array<AttachmentBlendState, engine::ColorTargetCount> attachmentBlendStates;
 
+        std::array<u16, engine::VertexStreamCount> vertexStrides; //!< Use {Set, Get}VertexBinding
+
         struct TransformFeedbackVarying {
             u16 stride;
             u8 offsetWords;
@@ -103,9 +107,12 @@ namespace skyline::gpu::interconnect::maxwell3d {
         };
         std::array<TransformFeedbackVarying, 0x100> transformFeedbackVaryings{};
 
-        void SetColorRenderTargetFormat(size_t index, engine::ColorTarget::Format format);
+        /**
+         * @param rawIndex Index in HW ignoring the ctSelect register
+         */
+        void SetColorRenderTargetFormat(size_t rawIndex, engine::ColorTarget::Format format);
 
-        void SetDepthRenderTargetFormat(engine::ZtFormat format);
+        void SetDepthRenderTargetFormat(engine::ZtFormat format, bool enabled);
 
         void SetVertexBinding(u32 index, engine::VertexStream stream, engine::VertexStreamInstance instance);
 
@@ -131,6 +138,20 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         void SetAttachmentBlendState(u32 index, bool enable, engine::CtWrite writeMask, engine::BlendPerTarget blend);
 
+        /**
+         * @param rawIndex Index in HW ignoring the ctSelect register
+         */
+        texture::Format GetColorRenderTargetFormat(size_t rawIndex) const;
+
+        /**
+         * @param rawIndex Index in HW ignoring the ctSelect register
+         */
+        bool IsColorRenderTargetEnabled(size_t rawIndex) const;
+
+        size_t GetColorRenderTargetCount() const;
+
+        texture::Format GetDepthRenderTargetFormat() const;
+
         std::array<vk::StencilOpState, 2> GetStencilOpsState() const;
 
         vk::PipelineColorBlendAttachmentState GetAttachmentBlendState(u32 index) const;
@@ -149,6 +170,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
             // Only hash transform feedback state if it's enabled
             if (other.transformFeedbackEnable && transformFeedbackEnable)
                 return std::memcmp(this, &other, sizeof(PackedPipelineState)) == 0;
+            else if (dynamicStateActive)
+                return std::memcmp(this, &other, offsetof(PackedPipelineState, vertexStrides)) == 0;
             else
                 return std::memcmp(this, &other, offsetof(PackedPipelineState, transformFeedbackVaryings)) == 0;
         }
@@ -159,6 +182,9 @@ namespace skyline::gpu::interconnect::maxwell3d {
             // Only hash transform feedback state if it's enabled
             if (state.transformFeedbackEnable)
                 return XXH64(&state, sizeof(PackedPipelineState), 0);
+            else if (state.dynamicStateActive)
+                return XXH64(&state, offsetof(PackedPipelineState, vertexStrides), 0);
+
 
             return XXH64(&state, offsetof(PackedPipelineState, transformFeedbackVaryings), 0);
         }

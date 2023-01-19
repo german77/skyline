@@ -44,7 +44,7 @@
 	url = https://github.com/ericniebler/range-v3
 [submodule "Sirit"]
 	path = app/libraries/sirit
-	url = https://github.com/ReinUsesLisp/sirit
+	url = https://github.com/yuzu-emu/sirit
 [submodule "Shader Compiler"]
 	path = app/libraries/shader-compiler
 	url = https://github.com/skyline-emu/shader-compiler.git
@@ -54,3 +54,6 @@
 [submodule "app/libraries/robin-map"]
 	path = app/libraries/robin-map
 	url = https://github.com/Tessil/robin-map
+[submodule "app/libraries/thread-pool"]
+	path = app/libraries/thread-pool
+	url = https://github.com/bshoshany/thread-pool.git

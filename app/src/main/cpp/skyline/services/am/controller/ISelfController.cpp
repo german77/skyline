@@ -9,7 +9,7 @@
 namespace skyline::service::am {
     ISelfController::ISelfController(const DeviceState &state, ServiceManager &manager)
         : libraryAppletLaunchableEvent(std::make_shared<type::KEvent>(state, false)),
-          accumulatedSuspendedTickChangedEvent(std::make_shared<type::KEvent>(state, false)),
+          accumulatedSuspendedTickChangedEvent(std::make_shared<type::KEvent>(state, true)),
           hosbinder(manager.CreateOrGetService<hosbinder::IHOSBinderDriver>("dispdrv")),
           BaseService(state, manager) {}
 
@@ -71,8 +71,13 @@ namespace skyline::service::am {
     }
 
     Result ISelfController::SetIdleTimeDetectionExtension(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
-        auto idleTimeDetectionExtension{request.Pop<u32>()};
+        idleTimeDetectionExtension = request.Pop<u32>();
         Logger::Debug("Setting Idle Time Detection Extension: 0x{:X}", idleTimeDetectionExtension);
+        return {};
+    }
+
+    Result ISelfController::GetIdleTimeDetectionExtension(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
+        response.Push<u32>(idleTimeDetectionExtension);
         return {};
     }
 
@@ -93,6 +98,10 @@ namespace skyline::service::am {
     Result ISelfController::SetAlbumImageTakenNotificationEnabled(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         auto albumImageTakenNotificationEnabled{request.Pop<u8>()};;
         Logger::Debug("Setting Album Image Taken Notification Enabled: {}", albumImageTakenNotificationEnabled);
+        return {};
+    }
+
+    Result ISelfController::SetRecordVolumeMuted(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response) {
         return {};
     }
 }

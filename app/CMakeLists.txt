@@ -115,6 +115,9 @@ add_subdirectory("libraries/robin-map")
 # Renderdoc in-app API
 include_directories("libraries/renderdoc")
 
+# Thread Pool
+include_directories("libraries/thread-pool")
+
 # Build Skyline with full debugging data and -Og for debug builds
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3 -glldb -gdwarf-5 -fno-omit-frame-pointer")
 # Build Skyline with full debugging data and some optimizations for reldebug builds, build speed is pioritised
@@ -182,24 +185,33 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/gpu/megabuffer.cpp
         ${source_DIR}/skyline/gpu/presentation_engine.cpp
         ${source_DIR}/skyline/gpu/shader_manager.cpp
+        ${source_DIR}/skyline/gpu/pipeline_cache_manager.cpp
         ${source_DIR}/skyline/gpu/cache/graphics_pipeline_cache.cpp
         ${source_DIR}/skyline/gpu/cache/renderpass_cache.cpp
         ${source_DIR}/skyline/gpu/cache/framebuffer_cache.cpp
         ${source_DIR}/skyline/gpu/interconnect/fermi_2d.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_dma.cpp
         ${source_DIR}/skyline/gpu/interconnect/inline2memory.cpp
-        ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/common.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/active_state.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/pipeline_state.cpp
+        ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/graphics_pipeline_state_accessor.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/packed_pipeline_state.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/pipeline_manager.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/constant_buffers.cpp
-        ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/samplers.cpp
-        ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/textures.cpp
         ${source_DIR}/skyline/gpu/interconnect/maxwell_3d/maxwell_3d.cpp
+        ${source_DIR}/skyline/gpu/interconnect/kepler_compute/pipeline_manager.cpp
+        ${source_DIR}/skyline/gpu/interconnect/kepler_compute/pipeline_state.cpp
+        ${source_DIR}/skyline/gpu/interconnect/kepler_compute/kepler_compute.cpp
+        ${source_DIR}/skyline/gpu/interconnect/kepler_compute/constant_buffers.cpp
         ${source_DIR}/skyline/gpu/interconnect/command_executor.cpp
         ${source_DIR}/skyline/gpu/interconnect/command_nodes.cpp
         ${source_DIR}/skyline/gpu/interconnect/conversion/quads.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/common.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/samplers.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/textures.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/shader_cache.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/pipeline_state_bundle.cpp
+        ${source_DIR}/skyline/gpu/interconnect/common/file_pipeline_state_accessor.cpp
         ${source_DIR}/skyline/gpu/shaders/helper_shaders.cpp
         ${source_DIR}/skyline/soc/smmu.cpp
         ${source_DIR}/skyline/soc/host1x/syncpoint.cpp
@@ -344,6 +356,7 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/services/visrv/ISystemDisplayService.cpp
         ${source_DIR}/skyline/services/pl/IPlatformServiceManager.cpp
         ${source_DIR}/skyline/services/aocsrv/IAddOnContentManager.cpp
+        ${source_DIR}/skyline/services/aocsrv/IPurchaseEventManager.cpp
         ${source_DIR}/skyline/services/pctl/IParentalControlServiceFactory.cpp
         ${source_DIR}/skyline/services/pctl/IParentalControlService.cpp
         ${source_DIR}/skyline/services/lm/ILogService.cpp
@@ -374,6 +387,8 @@ add_library(skyline SHARED
         ${source_DIR}/skyline/services/ssl/ISslContext.cpp
         ${source_DIR}/skyline/services/prepo/IPrepoService.cpp
         ${source_DIR}/skyline/services/mmnv/IRequest.cpp
+        ${source_DIR}/skyline/services/mii/IStaticService.cpp
+        ${source_DIR}/skyline/services/mii/IDatabaseService.cpp
         )
 target_include_directories(skyline PRIVATE ${source_DIR}/skyline)
 # target_precompile_headers(skyline PRIVATE ${source_DIR}/skyline/common.h) # PCH will currently break Intellisense

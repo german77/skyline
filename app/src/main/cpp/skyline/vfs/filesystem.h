@@ -16,6 +16,14 @@ namespace skyline::vfs {
             throw exception("This filesystem does not support creating files");
         };
 
+        virtual void DeleteFileImpl(const std::string &path) {
+            throw exception("This filesystem does not support deleting files");
+        }
+
+        virtual void DeleteDirectoryImpl(const std::string &path) {
+            throw exception("This filesystem does not support deleting directories");
+        }
+
         virtual bool CreateDirectoryImpl(const std::string &path, bool parents) {
             throw exception("This filesystem does not support creating directories");
         };
@@ -46,7 +54,15 @@ namespace skyline::vfs {
          */
         bool CreateFile(const std::string &path, size_t size) {
             return CreateFileImpl(path, size);
-        };
+        }
+
+        void DeleteFile(const std::string &path) {
+            DeleteFileImpl(path);
+        }
+
+        void DeleteDirectory(const std::string &path) {
+            DeleteDirectoryImpl(path);
+        }
 
         /**
          * @brief Creates a directory in the filesystem

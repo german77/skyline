@@ -24,7 +24,7 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
             .depthStencilRegisters = {*registers.depthTestEnable, *registers.depthWriteEnable, *registers.depthFunc, *registers.depthBoundsTestEnable, *registers.stencilTestEnable, *registers.twoSidedStencilTestEnable, *registers.stencilOps, *registers.stencilBack, *registers.alphaTestEnable, *registers.alphaFunc, *registers.alphaRef},
             .colorBlendRegisters = {*registers.logicOp, *registers.singleCtWriteControl, *registers.ctWrites, *registers.blendStatePerTargetEnable, *registers.blendPerTargets, *registers.blend},
             .transformFeedbackRegisters = {*registers.streamOutputEnable, *registers.streamOutControls, *registers.streamOutLayoutSelect},
-            .globalShaderConfigRegisters = {*registers.postVtgShaderAttributeSkipMask, *registers.bindlessTexture, *registers.apiMandatedEarlyZEnable},
+            .globalShaderConfigRegisters = {*registers.postVtgShaderAttributeSkipMask, *registers.bindlessTexture, *registers.apiMandatedEarlyZEnable, *registers.viewportScaleOffsetEnable},
             .ctSelect = *registers.ctSelect
         };
     }
@@ -35,7 +35,7 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
             .vertexBuffersRegisters = util::MergeInto<REGTYPE(VertexBufferState), type::VertexStreamCount>(*registers.vertexStreams, *registers.vertexStreamLimits),
             .indexBufferRegisters = {*registers.indexBuffer},
             .transformFeedbackBuffersRegisters = util::MergeInto<REGTYPE(TransformFeedbackBufferState), type::StreamOutBufferCount>(*registers.streamOutBuffers, *registers.streamOutputEnable),
-            .viewportsRegisters = util::MergeInto<REGTYPE(ViewportState), type::ViewportCount>(registers.viewports[0], registers.viewportClips[0], *registers.viewports, *registers.viewportClips, *registers.windowOrigin, *registers.viewportScaleOffsetEnable),
+            .viewportsRegisters = util::MergeInto<REGTYPE(ViewportState), type::ViewportCount>(registers.viewports[0], registers.viewportClips[0], *registers.viewports, *registers.viewportClips, *registers.windowOrigin, *registers.viewportScaleOffsetEnable, *registers.surfaceClip),
             .scissorsRegisters = util::MergeInto<REGTYPE(ScissorState), type::ViewportCount>(*registers.scissors),
             .lineWidthRegisters = {*registers.lineWidth, *registers.lineWidthAliased, *registers.aliasedLineWidthEnable},
             .depthBiasRegisters = {*registers.depthBias, *registers.depthBiasClamp, *registers.slopeScaleDepthBias},
@@ -50,7 +50,8 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
             .activeStateRegisters = MakeActiveStateRegisters(registers),
             .clearRegisters = {registers.scissors[0], registers.viewportClips[0], *registers.clearRect, *registers.colorClearValue, *registers.zClearValue, *registers.stencilClearValue, *registers.surfaceClip, *registers.clearSurfaceControl},
             .constantBufferSelectorRegisters = {*registers.constantBufferSelector},
-            .samplerPoolRegisters = {*registers.samplerBinding, *registers.texSamplerPool, *registers.texHeaderPool},
+            .samplerPoolRegisters = {*registers.texSamplerPool, *registers.texHeaderPool},
+            .samplerBinding = *registers.samplerBinding,
             .texturePoolRegisters = {*registers.texHeaderPool}
         };
     }
@@ -217,8 +218,10 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
 
             ENGINE_CASE(syncpointAction, {
                 Logger::Debug("Increment syncpoint: {}", static_cast<u16>(syncpointAction.id));
-                channelCtx.executor.Submit();
-                syncpoints.at(syncpointAction.id).Increment();
+                channelCtx.executor.Submit([=, syncpoints = &this->syncpoints, index = syncpointAction.id]() {
+                    syncpoints->at(index).host.Increment();
+                });
+                syncpoints.at(syncpointAction.id).guest.Increment();
             })
 
             ENGINE_CASE(clearSurface, {
@@ -337,18 +340,23 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
 
                 switch (info.op) {
                     case type::SemaphoreInfo::Op::Release:
-                        channelCtx.executor.Submit();
-                        WriteSemaphoreResult(registers.semaphore->payload);
+                        channelCtx.executor.Submit([=, this, semaphore = *registers.semaphore]() {
+                            WriteSemaphoreResult(semaphore, semaphore.payload);
+                        });
                         break;
 
                     case type::SemaphoreInfo::Op::Counter: {
                         switch (info.counterType) {
                             case type::SemaphoreInfo::CounterType::Zero:
-                                WriteSemaphoreResult(registers.semaphore->payload);
+                                WriteSemaphoreResult(*registers.semaphore, registers.semaphore->payload);
+                                break;
+                            case type::SemaphoreInfo::CounterType::SamplesPassed:
+                                // Return a fake result for now
+                                WriteSemaphoreResult(*registers.semaphore, 0xffffff);
                                 break;
 
                             default:
-                                //Logger::Warn("Unsupported semaphore counter type: 0x{:X}", static_cast<u8>(info.counterType));
+                                Logger::Warn("Unsupported semaphore counter type: 0x{:X}", static_cast<u8>(info.counterType));
                                 break;
                         }
                         break;
@@ -389,21 +397,19 @@ namespace skyline::soc::gm20b::engine::maxwell3d {
         }
     }
 
-    void Maxwell3D::WriteSemaphoreResult(u64 result) {
-        u64 address{registers.semaphore->address};
-
-        switch (registers.semaphore->info.structureSize) {
+    void Maxwell3D::WriteSemaphoreResult(const Registers::Semaphore &semaphore, u64 result) {
+        switch (semaphore.info.structureSize) {
             case type::SemaphoreInfo::StructureSize::OneWord:
-                channelCtx.asCtx->gmmu.Write(address, static_cast<u32>(result));
-                Logger::Debug("address: 0x{:X} payload: {}", address, result);
+                channelCtx.asCtx->gmmu.Write(semaphore.address, static_cast<u32>(result));
+                Logger::Debug("address: 0x{:X} payload: {}", semaphore.address, result);
                 break;
 
             case type::SemaphoreInfo::StructureSize::FourWords: {
                 // Write timestamp first to ensure correct ordering
                 u64 timestamp{GetGpuTimeTicks()};
-                channelCtx.asCtx->gmmu.Write(address + 8, timestamp);
-                channelCtx.asCtx->gmmu.Write(address, result);
-                Logger::Debug("address: 0x{:X} payload: {} timestamp: {}", address, result, timestamp);
+                channelCtx.asCtx->gmmu.Write(semaphore.address + 8, timestamp);
+                channelCtx.asCtx->gmmu.Write(semaphore.address, result);
+                Logger::Debug("address: 0x{:X} payload: {} timestamp: {}", semaphore.address, result, timestamp);
 
                 break;
             }

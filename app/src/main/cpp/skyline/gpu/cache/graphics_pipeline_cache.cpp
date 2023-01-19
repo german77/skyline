@@ -6,7 +6,10 @@
 #include "graphics_pipeline_cache.h"
 
 namespace skyline::gpu::cache {
-    GraphicsPipelineCache::GraphicsPipelineCache(GPU &gpu) : gpu(gpu), vkPipelineCache(gpu.vkDevice, vk::PipelineCacheCreateInfo{}) {}
+    GraphicsPipelineCache::GraphicsPipelineCache(GPU &gpu)
+        : gpu{gpu},
+          vkPipelineCache{gpu.vkDevice, vk::PipelineCacheCreateInfo{}},
+          pool{gpu.traits.quirks.brokenMultithreadedPipelineCompilation ? 1U : 0U} {}
 
     #define VEC_CPY(pointer, size) state.pointer, state.pointer + state.size
 
@@ -25,6 +28,8 @@ namespace skyline::gpu::cache {
           multisampleState(state.multisampleState),
           depthStencilState(state.depthStencilState),
           colorBlendState(state.colorBlendState),
+          dynamicStates(VEC_CPY(dynamicState.pDynamicStates, dynamicState.dynamicStateCount)),
+          dynamicState(state.dynamicState),
           colorBlendAttachments(VEC_CPY(colorBlendState.pAttachments, colorBlendState.attachmentCount)) {
         auto &vertexInputState{vertexState.get<vk::PipelineVertexInputStateCreateInfo>()};
         vertexInputState.pVertexBindingDescriptions = vertexBindings.data();
@@ -36,15 +41,13 @@ namespace skyline::gpu::cache {
 
         colorBlendState.pAttachments = colorBlendAttachments.data();
 
-        for (auto &colorAttachment : state.colorAttachments) {
-            if (colorAttachment)
-                colorAttachments.emplace_back(AttachmentMetadata{colorAttachment->format->vkFormat, colorAttachment->texture->sampleCount});
-            else
-                colorAttachments.emplace_back(AttachmentMetadata{vk::Format::eUndefined, vk::SampleCountFlagBits::e1});
-        }
+        dynamicState.pDynamicStates = dynamicStates.data();
 
-        if (state.depthStencilAttachment)
-            depthStencilAttachment.emplace(AttachmentMetadata{state.depthStencilAttachment->format->vkFormat, state.depthStencilAttachment->texture->sampleCount});
+        for (auto &colorFormat : state.colorFormats)
+            colorFormats.emplace_back(colorFormat);
+
+        depthStencilFormat = state.depthStencilFormat;
+        sampleCount = state.sampleCount;
     }
 
     #undef VEC_CPY
@@ -168,45 +171,24 @@ namespace skyline::gpu::cache {
             HASH(static_cast<VkBlendFactor>(attachment.srcColorBlendFactor));
         }
 
+        HASH(key.dynamicState.dynamicStateCount);
+
+        HASH(key.colorFormats.size());
+        for (auto format : key.colorFormats)
+            HASH(format);
+
+        HASH(key.depthStencilFormat);
+        HASH(key.sampleCount);
+
         return hash;
     }
 
     size_t GraphicsPipelineCache::PipelineStateHash::operator()(const GraphicsPipelineCache::PipelineState &key) const {
-        size_t hash{HashCommonPipelineState(key)};
-
-        HASH(key.colorAttachments.size());
-        for (const auto &attachment : key.colorAttachments) {
-            if (attachment) {
-                HASH(attachment->format->vkFormat);
-                HASH(attachment->texture->sampleCount);
-            }
-        }
-
-        HASH(key.depthStencilAttachment != nullptr);
-        if (key.depthStencilAttachment != nullptr) {
-            HASH(key.depthStencilAttachment->format->vkFormat);
-            HASH(key.depthStencilAttachment->texture->sampleCount);
-        }
-
-        return hash;
+        return HashCommonPipelineState(key);
     }
 
     size_t GraphicsPipelineCache::PipelineStateHash::operator()(const GraphicsPipelineCache::PipelineCacheKey &key) const {
-        size_t hash{HashCommonPipelineState(key)};
-
-        HASH(key.colorAttachments.size());
-        for (const auto &attachment : key.colorAttachments) {
-            HASH(attachment.format);
-            HASH(attachment.sampleCount);
-        }
-
-        HASH(key.depthStencilAttachment.has_value());
-        if (key.depthStencilAttachment) {
-            HASH(key.depthStencilAttachment->format);
-            HASH(key.depthStencilAttachment->sampleCount);
-        }
-
-        return hash;
+        return HashCommonPipelineState(key);
     }
 
     #undef HASH
@@ -296,16 +278,13 @@ namespace skyline::gpu::cache {
             KEYNEQ(colorBlendState.blendConstants)
         )
 
-        RETF(CARREQ(colorAttachments.begin(), colorAttachments.size(), {
-            return lhs.format == rhs->format->vkFormat && lhs.sampleCount == rhs->texture->sampleCount;
+        RETF(CARREQ(colorFormats.begin(), colorFormats.size(), {
+            return lhs == rhs;
         }))
 
-        RETF(lhs.depthStencilAttachment.has_value() != (rhs.depthStencilAttachment != nullptr) ||
-            (lhs.depthStencilAttachment.has_value() &&
-                lhs.depthStencilAttachment->format != rhs.depthStencilAttachment->format->vkFormat &&
-                lhs.depthStencilAttachment->sampleCount != rhs.depthStencilAttachment->texture->sampleCount
-            )
-        )
+        RETF(lhs.depthStencilFormat == rhs.depthStencilFormat)
+        RETF(lhs.sampleCount == rhs.sampleCount)
+
 
         #undef ARREQ
         #undef CARREQ
@@ -320,51 +299,28 @@ namespace skyline::gpu::cache {
         return lhs == rhs;
     }
 
-    GraphicsPipelineCache::PipelineCacheEntry::PipelineCacheEntry(vk::raii::DescriptorSetLayout &&descriptorSetLayout, vk::raii::PipelineLayout &&pipelineLayout, vk::raii::Pipeline &&pipeline) : descriptorSetLayout(std::move(descriptorSetLayout)), pipelineLayout(std::move(pipelineLayout)), pipeline(std::move(pipeline)) {}
+    GraphicsPipelineCache::PipelineCacheEntry::PipelineCacheEntry(vk::raii::DescriptorSetLayout &&descriptorSetLayout, vk::raii::PipelineLayout &&pipelineLayout) : descriptorSetLayout{std::move(descriptorSetLayout)}, pipelineLayout{std::move(pipelineLayout)} {}
 
-    GraphicsPipelineCache::CompiledPipeline::CompiledPipeline(const PipelineCacheEntry &entry) : descriptorSetLayout(*entry.descriptorSetLayout), pipelineLayout(*entry.pipelineLayout), pipeline(*entry.pipeline) {}
-
-    GraphicsPipelineCache::CompiledPipeline GraphicsPipelineCache::GetCompiledPipeline(const PipelineState &state, span<const vk::DescriptorSetLayoutBinding> layoutBindings, span<const vk::PushConstantRange> pushConstantRanges, bool noPushDescriptors) {
-        std::unique_lock lock(mutex);
-
-        auto it{pipelineCache.find(state)};
-        if (it != pipelineCache.end())
-            return CompiledPipeline{it->second};
-
-        lock.unlock();
-
-        vk::raii::DescriptorSetLayout descriptorSetLayout{gpu.vkDevice, vk::DescriptorSetLayoutCreateInfo{
-            .flags = vk::DescriptorSetLayoutCreateFlags{(!noPushDescriptors && gpu.traits.supportsPushDescriptors) ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}},
-            .pBindings = layoutBindings.data(),
-            .bindingCount = static_cast<u32>(layoutBindings.size()),
-        }};
-
-        vk::raii::PipelineLayout pipelineLayout{gpu.vkDevice, vk::PipelineLayoutCreateInfo{
-            .pSetLayouts = &*descriptorSetLayout,
-            .setLayoutCount = 1,
-            .pPushConstantRanges = pushConstantRanges.data(),
-            .pushConstantRangeCount = static_cast<u32>(pushConstantRanges.size()),
-        }};
-
+    vk::raii::Pipeline GraphicsPipelineCache::BuildPipeline(const PipelineCacheKey &key, vk::PipelineLayout pipelineLayout) {
         boost::container::small_vector<vk::AttachmentDescription, 8> attachmentDescriptions;
         boost::container::small_vector<vk::AttachmentReference, 8> attachmentReferences;
 
-        auto pushAttachment{[&](TextureView *view) {
-            if (view) {
+        auto pushAttachment{[&](vk::Format format) {
+            if (format != vk::Format::eUndefined) {
                 attachmentDescriptions.push_back(vk::AttachmentDescription{
-                    .format = view->format->vkFormat,
-                    .samples = view->texture->sampleCount,
+                    .format = format,
+                    .samples = key.sampleCount,
                     .loadOp = vk::AttachmentLoadOp::eLoad,
                     .storeOp = vk::AttachmentStoreOp::eStore,
                     .stencilLoadOp = vk::AttachmentLoadOp::eLoad,
                     .stencilStoreOp = vk::AttachmentStoreOp::eStore,
-                    .initialLayout = view->texture->layout,
-                    .finalLayout = view->texture->layout,
+                    .initialLayout = vk::ImageLayout::eGeneral,
+                    .finalLayout = vk::ImageLayout::eGeneral,
                     .flags = vk::AttachmentDescriptionFlagBits::eMayAlias
                 });
                 attachmentReferences.push_back(vk::AttachmentReference{
                     .attachment = static_cast<u32>(attachmentDescriptions.size() - 1),
-                    .layout = view->texture->layout,
+                    .layout = vk::ImageLayout::eGeneral,
                 });
             } else {
                 attachmentReferences.push_back(vk::AttachmentReference{
@@ -378,11 +334,11 @@ namespace skyline::gpu::cache {
             .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
         };
 
-        for (auto &colorAttachment : state.colorAttachments)
+        for (auto &colorAttachment : key.colorFormats)
             pushAttachment(colorAttachment);
 
-        if (state.depthStencilAttachment) {
-            pushAttachment(state.depthStencilAttachment);
+        if (key.depthStencilFormat != vk::Format::eUndefined) {
+            pushAttachment(key.depthStencilFormat);
 
             subpassDescription.pColorAttachments = attachmentReferences.data();
             subpassDescription.colorAttachmentCount = static_cast<u32>(attachmentReferences.size() - 1);
@@ -399,25 +355,52 @@ namespace skyline::gpu::cache {
             .pSubpasses = &subpassDescription,
         }};
 
-        auto pipeline{gpu.vkDevice.createGraphicsPipeline(vkPipelineCache, vk::GraphicsPipelineCreateInfo{
-            .pStages = state.shaderStages.data(),
-            .stageCount = static_cast<u32>(state.shaderStages.size()),
-            .pVertexInputState = &state.vertexState.get<vk::PipelineVertexInputStateCreateInfo>(),
-            .pInputAssemblyState = &state.inputAssemblyState,
-            .pViewportState = &state.viewportState,
-            .pRasterizationState = &state.rasterizationState.get<vk::PipelineRasterizationStateCreateInfo>(),
-            .pMultisampleState = &state.multisampleState,
-            .pDepthStencilState = &state.depthStencilState,
-            .pColorBlendState = &state.colorBlendState,
-            .pDynamicState = &state.dynamicState,
-            .layout = *pipelineLayout,
+        return gpu.vkDevice.createGraphicsPipeline(vkPipelineCache, vk::GraphicsPipelineCreateInfo{
+            .pStages = key.shaderStages.data(),
+            .stageCount = static_cast<u32>(key.shaderStages.size()),
+            .pVertexInputState = &key.vertexState.get<vk::PipelineVertexInputStateCreateInfo>(),
+            .pInputAssemblyState = &key.inputAssemblyState,
+            .pViewportState = &key.viewportState,
+            .pRasterizationState = &key.rasterizationState.get<vk::PipelineRasterizationStateCreateInfo>(),
+            .pMultisampleState = &key.multisampleState,
+            .pDepthStencilState = &key.depthStencilState,
+            .pColorBlendState = &key.colorBlendState,
+            .pDynamicState = &key.dynamicState,
+            .layout = pipelineLayout,
             .renderPass = *renderPass,
             .subpass = 0,
-        })};
+        });
+    }
 
-        lock.lock();
+    GraphicsPipelineCache::CompiledPipeline::CompiledPipeline(const PipelineCacheEntry &entry) : descriptorSetLayout{*entry.descriptorSetLayout}, pipelineLayout{*entry.pipelineLayout}, pipeline{*entry.pipeline} {}
 
-        auto pipelineEntryIt{pipelineCache.try_emplace(PipelineCacheKey{state}, std::move(descriptorSetLayout), std::move(pipelineLayout), std::move(pipeline))};
+    GraphicsPipelineCache::CompiledPipeline GraphicsPipelineCache::GetCompiledPipeline(const PipelineState &state, span<const vk::DescriptorSetLayoutBinding> layoutBindings, span<const vk::PushConstantRange> pushConstantRanges, bool noPushDescriptors) {
+        std::unique_lock lock(mutex);
+
+        auto it{pipelineCache.find(state)};
+        if (it != pipelineCache.end())
+            return CompiledPipeline{it->second};
+
+        vk::raii::DescriptorSetLayout descriptorSetLayout{gpu.vkDevice, vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlags{(!noPushDescriptors && gpu.traits.supportsPushDescriptors) ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags{}},
+            .pBindings = layoutBindings.data(),
+            .bindingCount = static_cast<u32>(layoutBindings.size()),
+        }};
+
+        vk::raii::PipelineLayout pipelineLayout{gpu.vkDevice, vk::PipelineLayoutCreateInfo{
+            .pSetLayouts = &*descriptorSetLayout,
+            .setLayoutCount = 1,
+            .pPushConstantRanges = pushConstantRanges.data(),
+            .pushConstantRangeCount = static_cast<u32>(pushConstantRanges.size()),
+        }};
+
+        auto pipelineEntryIt{pipelineCache.try_emplace(PipelineCacheKey{state}, std::move(descriptorSetLayout), std::move(pipelineLayout))};
+        auto pipelineFuture{pool.submit(&GraphicsPipelineCache::BuildPipeline, this, std::ref(pipelineEntryIt.first->first), std::ref(*pipelineEntryIt.first->second.pipelineLayout))};
+        pipelineEntryIt.first->second.pipeline = pipelineFuture.share();
         return CompiledPipeline{pipelineEntryIt.first->second};
+    }
+
+    void GraphicsPipelineCache::WaitIdle() {
+        pool.wait_for_tasks();
     }
 }

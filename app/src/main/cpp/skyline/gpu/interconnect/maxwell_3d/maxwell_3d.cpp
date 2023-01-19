@@ -4,11 +4,11 @@
 
 #include <gpu/interconnect/command_executor.h>
 #include <gpu/interconnect/conversion/quads.h>
+#include <gpu/interconnect/common/state_updater.h>
 #include <soc/gm20b/channel.h>
 #include "common/utils.h"
 #include "maxwell_3d.h"
 #include "common.h"
-#include "state_updater.h"
 
 namespace skyline::gpu::interconnect::maxwell3d {
     Maxwell3D::Maxwell3D(GPU &gpu,
@@ -22,6 +22,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
           clearEngineRegisters{registerBundle.clearRegisters},
           constantBuffers{manager, registerBundle.constantBufferSelectorRegisters},
           samplers{manager, registerBundle.samplerPoolRegisters},
+          samplerBinding{registerBundle.samplerBinding},
           textures{manager, registerBundle.texturePoolRegisters},
           directState{activeState.directState} {
         ctx.executor.AddFlushCallback([this] {
@@ -213,6 +214,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         StateUpdateBuilder builder{*ctx.executor.allocator};
 
         Pipeline *oldPipeline{activeState.GetPipeline()};
+        samplers.Update(ctx, samplerBinding.value == engine::SamplerBinding::Value::ViaHeaderBinding);
         activeState.Update(ctx, textures, constantBuffers.boundConstantBuffers, builder, indexed, topology, first, count);
         if (directState.inputAssembly.NeedsQuadConversion()) {
             count = conversion::quads::GetIndexCount(count);
@@ -245,7 +247,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
 
         if (oldPipeline != pipeline)
             // If the pipeline has changed, we need to update the pipeline state
-            builder.SetPipeline(pipeline->compiledPipeline.pipeline);
+            builder.SetPipeline(pipeline->compiledPipeline.pipeline, vk::PipelineBindPoint::eGraphics);
 
         if (descUpdateInfo) {
             if (ctx.gpu.traits.supportsPushDescriptors) {
@@ -292,6 +294,18 @@ namespace skyline::gpu::interconnect::maxwell3d {
             {surfaceClip.horizontal.width, surfaceClip.vertical.height}
         };
 
+        auto colorAttachments{activeState.GetColorAttachments()};
+        auto depthStencilAttachment{activeState.GetDepthAttachment()};
+        auto depthStencilAttachmentSpan{depthStencilAttachment ? span<TextureView *>(depthStencilAttachment) : span<TextureView *>()};
+        for (auto attachment : ranges::views::concat(colorAttachments, depthStencilAttachmentSpan)) {
+            if (attachment) {
+                scissor.extent.width = std::min(scissor.extent.width, static_cast<u32>(static_cast<i32>(attachment->texture->dimensions.width) - scissor.offset.x));
+                scissor.extent.height = std::min(scissor.extent.height, static_cast<u32>(static_cast<i32>(attachment->texture->dimensions.height) - scissor.offset.y));
+            }
+        }
+
+        constantBuffers.ResetQuickBind();
+
         ctx.executor.AddSubpass([drawParams](vk::raii::CommandBuffer &commandBuffer, const std::shared_ptr<FenceCycle> &, GPU &gpu, vk::RenderPass, u32) {
             drawParams->stateUpdater.RecordAll(gpu, commandBuffer);
 
@@ -307,6 +321,5 @@ namespace skyline::gpu::interconnect::maxwell3d {
                 commandBuffer.endTransformFeedbackEXT(0, {}, {});
         }, scissor, activeDescriptorSetSampledImages, {}, activeState.GetColorAttachments(), activeState.GetDepthAttachment(), !ctx.gpu.traits.quirks.relaxedRenderPassCompatibility);
 
-        constantBuffers.ResetQuickBind();
     }
 }

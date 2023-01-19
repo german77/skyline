@@ -12,10 +12,7 @@ import android.view.ViewTreeObserver
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.coordinatorlayout.widget.CoordinatorLayout
-import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.viewbinding.ViewBinding
 import com.google.android.material.snackbar.Snackbar
@@ -29,6 +26,7 @@ import emu.skyline.databinding.GpuDriverActivityBinding
 import emu.skyline.utils.GpuDriverHelper
 import emu.skyline.utils.GpuDriverInstallResult
 import emu.skyline.utils.PreferenceSettings
+import emu.skyline.utils.WindowInsetsHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -59,7 +57,7 @@ class GpuDriverActivity : AppCompatActivity() {
                     val result = GpuDriverHelper.installDriver(this@GpuDriverActivity, fileStream)
                     runOnUiThread {
                         Snackbar.make(binding.root, resolveInstallResultString(result), Snackbar.LENGTH_LONG).show()
-                        if (result == GpuDriverInstallResult.SUCCESS)
+                        if (result == GpuDriverInstallResult.Success)
                             populateAdapter()
                     }
                 }
@@ -127,12 +125,8 @@ class GpuDriverActivity : AppCompatActivity() {
 
         setContentView(binding.root)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        // Apply inset padding to the driver list recycler view to avoid navigation bar overlap
-        ViewCompat.setOnApplyWindowInsetsListener(binding.driverList) { view, windowInsets ->
-            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            view.updatePadding(bottom = insets.bottom)
-            WindowInsetsCompat.CONSUMED
-        }
+        WindowInsetsHelper.applyToActivity(binding.root, binding.driverList)
+        WindowInsetsHelper.addMargin(binding.addDriverButton, bottom = true)
 
         setSupportActionBar(binding.titlebar.toolbar)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -185,11 +179,11 @@ class GpuDriverActivity : AppCompatActivity() {
     }
 
     private fun resolveInstallResultString(result : GpuDriverInstallResult) = when (result) {
-        GpuDriverInstallResult.SUCCESS -> getString(R.string.gpu_driver_install_success)
-        GpuDriverInstallResult.INVALID_ARCHIVE -> getString(R.string.gpu_driver_install_invalid_archive)
-        GpuDriverInstallResult.MISSING_METADATA -> getString(R.string.gpu_driver_install_missing_metadata)
-        GpuDriverInstallResult.INVALID_METADATA -> getString(R.string.gpu_driver_install_invalid_metadata)
-        GpuDriverInstallResult.UNSUPPORTED_ANDROID_VERSION -> getString(R.string.gpu_driver_install_unsupported_android_version)
-        GpuDriverInstallResult.ALREADY_INSTALLED -> getString(R.string.gpu_driver_install_already_installed)
+        GpuDriverInstallResult.Success -> getString(R.string.gpu_driver_install_success)
+        GpuDriverInstallResult.InvalidArchive -> getString(R.string.gpu_driver_install_invalid_archive)
+        GpuDriverInstallResult.MissingMetadata -> getString(R.string.gpu_driver_install_missing_metadata)
+        GpuDriverInstallResult.InvalidMetadata -> getString(R.string.gpu_driver_install_invalid_metadata)
+        GpuDriverInstallResult.UnsupportedAndroidVersion -> getString(R.string.gpu_driver_install_unsupported_android_version)
+        GpuDriverInstallResult.AlreadyInstalled -> getString(R.string.gpu_driver_install_already_installed)
     }
 }

@@ -4,15 +4,16 @@
 #pragma once
 
 #include <tsl/robin_map.h>
-#include <shader_compiler/runtime_info.h>
+#include <shader_compiler/shader_info.h>
+#include <gpu/texture/texture.h>
 #include "common.h"
 #include "tic.h"
 
-namespace skyline::gpu::interconnect::maxwell3d {
+namespace skyline::gpu::interconnect {
     class TexturePoolState : dirty::CachedManualDirty {
       public:
         struct EngineRegisters {
-            const engine::TexHeaderPool &texHeaderPool;
+            const engine_common::TexHeaderPool &texHeaderPool;
 
             void DirtyBind(DirtyManager &manager, dirty::Handle handle) const;
         };
@@ -40,7 +41,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         struct CacheEntry {
             TextureImageControl tic;
             TextureView *view;
-            u32 executionNumber;
+            ContextTag executionTag;
         };
         std::vector<CacheEntry> textureHeaderCache;
 

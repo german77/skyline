@@ -73,6 +73,8 @@ namespace skyline::service::fssrv {
          */
         Result OpenSdCardFileSystem(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
+        Result GetCacheStorageSize(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
         /**
          * @brief Returns a handle to an instance of #IFileSystem
          * @url https://switchbrew.org/wiki/Filesystem_services#IFileSystem for the requested save data area
@@ -99,6 +101,8 @@ namespace skyline::service::fssrv {
          */
         Result OpenDataStorageByDataId(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
 
+        Result OpenPatchDataStorageByCurrentProcess(type::KSession &session, ipc::IpcRequest &request, ipc::IpcResponse &response);
+
         /**
           * @brief Returns the filesystem log access mode
           * @url https://switchbrew.org/wiki/Filesystem_services#GetGlobalAccessLogMode
@@ -108,10 +112,12 @@ namespace skyline::service::fssrv {
         SERVICE_DECL(
             SFUNC(0x1, IFileSystemProxy, SetCurrentProcess),
             SFUNC(0x12, IFileSystemProxy, OpenSdCardFileSystem),
+            SFUNC(0x22, IFileSystemProxy, GetCacheStorageSize),
             SFUNC(0x33, IFileSystemProxy, OpenSaveDataFileSystem),
             SFUNC(0x35, IFileSystemProxy, OpenReadOnlySaveDataFileSystem),
             SFUNC(0xC8, IFileSystemProxy, OpenDataStorageByCurrentProcess),
             SFUNC(0xCA, IFileSystemProxy, OpenDataStorageByDataId),
+            SFUNC(0xCB, IFileSystemProxy, OpenPatchDataStorageByCurrentProcess),
             SFUNC(0x3ED, IFileSystemProxy, GetGlobalAccessLogMode)
         )
     };

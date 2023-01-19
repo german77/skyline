@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
+// Copyright © 2022 yuzu Team and Contributors (https://github.com/yuzu-emu/)
 // Copyright © 2022 Skyline Team and Contributors (https://github.com/skyline-emu/)
 
 #include <gpu/texture/texture.h>
 #include <gpu/interconnect/command_executor.h>
+#include <gpu/interconnect/common/pipeline.inc>
+#include <gpu/interconnect/common/file_pipeline_state_accessor.h>
 #include <gpu/cache/graphics_pipeline_cache.h>
 #include <gpu/shader_manager.h>
 #include <gpu.h>
+#include "graphics_pipeline_state_accessor.h"
 #include "pipeline_manager.h"
 
 namespace skyline::gpu::interconnect::maxwell3d {
-    union BindlessHandle {
-        u32 raw;
-
-        struct {
-            u32 textureIndex : 20;
-            u32 samplerIndex : 12;
-        };
-    };
-
     static constexpr Shader::Stage ConvertCompilerShaderStage(engine::Pipeline::Shader::Type stage) {
         switch (stage) {
             case engine::Pipeline::Shader::Type::VertexCullBeforeFetch:
@@ -99,6 +94,16 @@ namespace skyline::gpu::interconnect::maxwell3d {
         }
     }
 
+    static Shader::OutputTopology ConvertShaderOutputTopology(engine::DrawTopology topology) {
+        switch (topology) {
+            case engine::DrawTopology::Points:
+                return Shader::OutputTopology::PointList;
+            case engine::DrawTopology::LineStrip:
+                return Shader::OutputTopology::LineStrip;
+            default:
+                return Shader::OutputTopology::TriangleStrip;
+        }
+    }
     /**
      * @notes Roughly based on https://github.com/yuzu-emu/yuzu/blob/4ffbbc534884841f9a5536e57539bf3d1642af26/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp#L127
      */
@@ -181,51 +186,61 @@ namespace skyline::gpu::interconnect::maxwell3d {
         return info;
     }
 
-    static std::array<Pipeline::ShaderStage, engine::ShaderStageCount> MakePipelineShaders(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries) {
-        ctx.gpu.shader.ResetPools();
+    static std::array<Pipeline::ShaderStage, engine::ShaderStageCount> MakePipelineShaders(GPU &gpu, const PipelineStateAccessor &accessor, const PackedPipelineState &packedState) {
+        gpu.shader.ResetPools();
 
         using PipelineStage = engine::Pipeline::Shader::Type;
-        auto pipelineStage{[](size_t i) { return static_cast<PipelineStage>(i); }};
+        auto pipelineStage{[](u32 i) { return static_cast<PipelineStage>(i); }};
         auto stageIdx{[](PipelineStage stage) { return static_cast<u8>(stage); }};
 
         std::array<Shader::IR::Program, engine::PipelineCount> programs;
+        Shader::IR::Program *layerConversionSourceProgram{};
         bool ignoreVertexCullBeforeFetch{};
 
-        for (size_t i{}; i < engine::PipelineCount; i++) {
-            if (!packedState.shaderHashes[i])
-                continue;
+        for (u32 i{}; i < engine::PipelineCount; i++) {
+            if (!packedState.shaderHashes[i]) {
+                if (i == stageIdx(PipelineStage::Geometry) && layerConversionSourceProgram)
+                    programs[i] = gpu.shader.GenerateGeometryPassthroughShader(*layerConversionSourceProgram, ConvertShaderOutputTopology(packedState.topology));
 
-            auto program{ctx.gpu.shader.ParseGraphicsShader(
+                continue;
+            }
+
+            auto binary{accessor.GetShaderBinary(i)};
+            auto program{gpu.shader.ParseGraphicsShader(
                 packedState.postVtgShaderAttributeSkipMask,
                 ConvertCompilerShaderStage(static_cast<PipelineStage>(i)),
-                shaderBinaries[i].binary, shaderBinaries[i].baseOffset,
+                binary.binary, binary.baseOffset,
                 packedState.bindlessTextureConstantBufferSlotSelect,
+                packedState.viewportTransformEnable,
                 [&](u32 index, u32 offset) {
-                    size_t shaderStage{i > 0 ? (i - 1) : 0};
-                    return constantBuffers[shaderStage][index].Read<int>(ctx.executor, offset);
+                    u32 shaderStage{i > 0 ? (i - 1) : 0};
+                    return accessor.GetConstantBufferValue(shaderStage, index, offset);
                 }, [&](u32 index) {
-                    return textures.GetTextureType(ctx, BindlessHandle{ .raw = index }.textureIndex);
+                    return accessor.GetTextureType(BindlessHandle{ .raw = index }.textureIndex);
                 })};
             if (i == stageIdx(PipelineStage::Vertex) && packedState.shaderHashes[stageIdx(PipelineStage::VertexCullBeforeFetch)]) {
                 ignoreVertexCullBeforeFetch = true;
-                programs[i] = ctx.gpu.shader.CombineVertexShaders(programs[stageIdx(PipelineStage::VertexCullBeforeFetch)], program, shaderBinaries[i].binary);
+                programs[i] = gpu.shader.CombineVertexShaders(programs[stageIdx(PipelineStage::VertexCullBeforeFetch)], program, binary.binary);
             } else {
                 programs[i] = program;
             }
+
+            if (programs[i].info.requires_layer_emulation)
+                layerConversionSourceProgram = &programs[i];
         }
 
-        bool hasGeometry{packedState.shaderHashes[stageIdx(PipelineStage::Geometry)] && programs[stageIdx(PipelineStage::Geometry)].is_geometry_passthrough};
+        bool hasGeometry{packedState.shaderHashes[stageIdx(PipelineStage::Geometry)] && !programs[stageIdx(PipelineStage::Geometry)].is_geometry_passthrough};
         Shader::Backend::Bindings bindings{};
         Shader::IR::Program *lastProgram{};
 
         std::array<Pipeline::ShaderStage, engine::ShaderStageCount> shaderStages{};
 
-        for (size_t i{stageIdx(ignoreVertexCullBeforeFetch ? PipelineStage::Vertex : PipelineStage::VertexCullBeforeFetch)}; i < engine::PipelineCount; i++) {
-            if (!packedState.shaderHashes[i])
+        for (u32 i{stageIdx(ignoreVertexCullBeforeFetch ? PipelineStage::Vertex : PipelineStage::VertexCullBeforeFetch)}; i < engine::PipelineCount; i++) {
+            if (!packedState.shaderHashes[i] && !(i == stageIdx(PipelineStage::Geometry) && layerConversionSourceProgram))
                 continue;
 
             auto runtimeInfo{MakeRuntimeInfo(packedState, programs[i], lastProgram, hasGeometry)};
-            shaderStages[i - (i >= 1 ? 1 : 0)] = {ConvertVkShaderStage(pipelineStage(i)), ctx.gpu.shader.CompileShader(runtimeInfo, programs[i], bindings), programs[i].info};
+            shaderStages[i - (i >= 1 ? 1 : 0)] = {ConvertVkShaderStage(pipelineStage(i)), gpu.shader.CompileShader(runtimeInfo, programs[i], bindings), programs[i].info};
 
             lastProgram = &programs[i];
         }
@@ -428,11 +443,10 @@ namespace skyline::gpu::interconnect::maxwell3d {
         }
     }
 
-    static cache::GraphicsPipelineCache::CompiledPipeline MakeCompiledPipeline(InterconnectContext &ctx,
+    static cache::GraphicsPipelineCache::CompiledPipeline MakeCompiledPipeline(GPU &gpu,
                                                                                const PackedPipelineState &packedState,
                                                                                const std::array<Pipeline::ShaderStage, engine::ShaderStageCount> &shaderStages,
-                                                                               span<vk::DescriptorSetLayoutBinding> layoutBindings,
-                                                                               span<TextureView *> colorAttachments, TextureView *depthAttachment) {
+                                                                               span<vk::DescriptorSetLayoutBinding> layoutBindings) {
         boost::container::static_vector<vk::PipelineShaderStageCreateInfo, engine::ShaderStageCount> shaderStageInfos;
         for (const auto &stage : shaderStages)
             if (stage.module)
@@ -450,15 +464,15 @@ namespace skyline::gpu::interconnect::maxwell3d {
             const auto &binding{packedState.vertexBindings[i]};
             bindingDescs.push_back({
                                        .binding = i,
-                                       .stride = binding.stride,
+                                       .stride = packedState.vertexStrides[i],
                                        .inputRate = binding.GetInputRate(),
                                    });
 
             if (binding.GetInputRate() == vk::VertexInputRate::eInstance) {
-                if (!ctx.gpu.traits.supportsVertexAttributeDivisor)
+                if (!gpu.traits.supportsVertexAttributeDivisor)
                     [[unlikely]]
                         Logger::Warn("Vertex attribute divisor used on guest without host support");
-                else if (!ctx.gpu.traits.supportsVertexAttributeZeroDivisor && binding.divisor == 0)
+                else if (!gpu.traits.supportsVertexAttributeZeroDivisor && binding.divisor == 0)
                     [[unlikely]]
                         Logger::Warn("Vertex attribute zero divisor used on guest without host support");
                 else
@@ -514,7 +528,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
         rasterizationCreateInfo.frontFace = packedState.frontFaceClockwise ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
         rasterizationCreateInfo.depthBiasEnable = packedState.depthBiasEnable;
         rasterizationCreateInfo.depthClampEnable = packedState.depthClampEnable;
-        if (!ctx.gpu.traits.supportsDepthClamp)
+        if (!gpu.traits.supportsDepthClamp)
             Logger::Warn("Depth clamp used on guest without host support");
         rasterizationState.get<vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT>().provokingVertexMode = ConvertProvokingVertex(packedState.provokingVertex);
 
@@ -533,8 +547,17 @@ namespace skyline::gpu::interconnect::maxwell3d {
         std::tie(depthStencilState.front, depthStencilState.back) = packedState.GetStencilOpsState();
 
         boost::container::static_vector<vk::PipelineColorBlendAttachmentState, engine::ColorTargetCount> attachmentBlendStates;
-        for (u32 i{}; i < colorAttachments.size(); i++)
-            attachmentBlendStates.push_back(packedState.GetAttachmentBlendState(i));
+        boost::container::static_vector<vk::Format, engine::ColorTargetCount> colorAttachmentFormats;
+
+        for (u32 i{}; i < engine::ColorTargetCount; i++) {
+            if (i < packedState.GetColorRenderTargetCount()) {
+                attachmentBlendStates.push_back(packedState.GetAttachmentBlendState(i));
+                texture::Format format{packedState.GetColorRenderTargetFormat(packedState.ctSelect[i])};
+                colorAttachmentFormats.push_back(format ? format->vkFormat : vk::Format::eUndefined);
+            } else {
+                colorAttachmentFormats.push_back(vk::Format::eUndefined);
+            }
+        }
 
         vk::PipelineColorBlendStateCreateInfo colorBlendState{
             .logicOpEnable = packedState.logicOpEnable,
@@ -543,7 +566,11 @@ namespace skyline::gpu::interconnect::maxwell3d {
             .pAttachments = attachmentBlendStates.data()
         };
 
-        constexpr std::array<vk::DynamicState, 9> dynamicStates{
+
+        static constexpr u32 BaseDynamicStateCount{9};
+        static constexpr u32 ExtendedDynamicStateCount{BaseDynamicStateCount + 1};
+
+        constexpr std::array<vk::DynamicState, ExtendedDynamicStateCount> dynamicStates{
             vk::DynamicState::eViewport,
             vk::DynamicState::eScissor,
             vk::DynamicState::eLineWidth,
@@ -552,11 +579,13 @@ namespace skyline::gpu::interconnect::maxwell3d {
             vk::DynamicState::eDepthBounds,
             vk::DynamicState::eStencilCompareMask,
             vk::DynamicState::eStencilWriteMask,
-            vk::DynamicState::eStencilReference
+            vk::DynamicState::eStencilReference,
+            // VK_EXT_dynamic_state starts here
+            vk::DynamicState::eVertexInputBindingStrideEXT
         };
 
         vk::PipelineDynamicStateCreateInfo dynamicState{
-            .dynamicStateCount = static_cast<u32>(dynamicStates.size()),
+            .dynamicStateCount = gpu.traits.supportsExtendedDynamicState ? ExtendedDynamicStateCount : BaseDynamicStateCount,
             .pDynamicStates = dynamicStates.data()
         };
 
@@ -565,13 +594,15 @@ namespace skyline::gpu::interconnect::maxwell3d {
         std::array<vk::Viewport, engine::ViewportCount> emptyViewports{};
 
         vk::PipelineViewportStateCreateInfo viewportState{
-            .viewportCount = static_cast<u32>(ctx.gpu.traits.supportsMultipleViewports ? engine::ViewportCount : 1),
+            .viewportCount = static_cast<u32>(gpu.traits.supportsMultipleViewports ? engine::ViewportCount : 1),
             .pViewports = emptyViewports.data(),
-            .scissorCount = static_cast<u32>(ctx.gpu.traits.supportsMultipleViewports ? engine::ViewportCount : 1),
+            .scissorCount = static_cast<u32>(gpu.traits.supportsMultipleViewports ? engine::ViewportCount : 1),
             .pScissors = emptyScissors.data(),
         };
 
-        return ctx.gpu.graphicsPipelineCache.GetCompiledPipeline(cache::GraphicsPipelineCache::PipelineState{
+        texture::Format depthStencilFormat{packedState.GetDepthRenderTargetFormat()};
+
+        return gpu.graphicsPipelineCache.GetCompiledPipeline(cache::GraphicsPipelineCache::PipelineState{
             .shaderStages = shaderStageInfos,
             .vertexState = vertexInputState,
             .inputAssemblyState = inputAssemblyState,
@@ -582,25 +613,27 @@ namespace skyline::gpu::interconnect::maxwell3d {
             .depthStencilState = depthStencilState,
             .colorBlendState = colorBlendState,
             .dynamicState = dynamicState,
-            .colorAttachments = colorAttachments,
-            .depthStencilAttachment = depthAttachment,
+            .colorFormats = colorAttachmentFormats,
+            .depthStencilFormat = depthStencilFormat ? depthStencilFormat->vkFormat : vk::Format::eUndefined,
+            .sampleCount = vk::SampleCountFlagBits::e1, //TODO: fix after MSAA support
         }, layoutBindings);
     }
 
-    Pipeline::Pipeline(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries, span<TextureView *> colorAttachments, TextureView *depthAttachment)
-        : shaderStages{MakePipelineShaders(ctx, textures, constantBuffers, packedState, shaderBinaries)},
-          descriptorInfo{MakePipelineDescriptorInfo(shaderStages, ctx.gpu.traits.quirks.needsIndividualTextureBindingWrites)},
-          compiledPipeline{MakeCompiledPipeline(ctx, packedState, shaderStages, descriptorInfo.descriptorSetLayoutBindings, colorAttachments, depthAttachment)},
-          sourcePackedState{packedState} {
+    Pipeline::Pipeline(GPU &gpu, PipelineStateAccessor &accessor, const PackedPipelineState &packedState)
+        : sourcePackedState{packedState},
+          shaderStages{MakePipelineShaders(gpu, accessor, sourcePackedState)},
+          descriptorInfo{MakePipelineDescriptorInfo(shaderStages, gpu.traits.quirks.needsIndividualTextureBindingWrites)},
+          compiledPipeline{MakeCompiledPipeline(gpu, sourcePackedState, shaderStages, descriptorInfo.descriptorSetLayoutBindings)} {
         storageBufferViews.resize(descriptorInfo.totalStorageBufferCount);
+        accessor.MarkComplete();
     }
 
-    void Pipeline::SyncCachedStorageBufferViews(u32 executionNumber) {
-        if (lastExecutionNumber != executionNumber) {
+    void Pipeline::SyncCachedStorageBufferViews(ContextTag executionTag) {
+        if (lastExecutionTag != executionTag) {
             for (auto &view : storageBufferViews)
                 view.PurgeCaches();
 
-            lastExecutionNumber = executionNumber;
+            lastExecutionTag = executionTag;
         }
     }
 
@@ -612,8 +645,10 @@ namespace skyline::gpu::interconnect::maxwell3d {
                 return false;
         })};
 
-        if (it != transitionCache.end())
-            return *it;
+        if (it != transitionCache.end()) {
+            std::swap(*it, *transitionCache.begin());
+            return *transitionCache.begin();
+        }
 
         return nullptr;
     }
@@ -642,81 +677,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
         return descriptorInfo.totalCombinedImageSamplerCount;
     }
 
-    static DynamicBufferBinding GetConstantBufferBinding(InterconnectContext &ctx, const Shader::Info &info, BufferView view, size_t idx) {
-        if (!view) // Return a dummy buffer if the constant buffer isn't bound
-            return BufferBinding{ctx.gpu.megaBufferAllocator.Allocate(ctx.executor.cycle, 0).buffer, 0, PAGE_SIZE};
-
-        ctx.executor.AttachBuffer(view);
-
-        size_t sizeOverride{std::min<size_t>(info.constant_buffer_used_sizes[idx], view.size)};
-        if (auto megaBufferBinding{view.TryMegaBuffer(ctx.executor.cycle, ctx.gpu.megaBufferAllocator, ctx.executor.executionNumber, sizeOverride)}) {
-            return megaBufferBinding;
-        } else {
-            view.GetBuffer()->BlockSequencedCpuBackingWrites();
-            return view;
-        }
-    }
-
-    static DynamicBufferBinding GetStorageBufferBinding(InterconnectContext &ctx, const Shader::StorageBufferDescriptor &desc, ConstantBuffer &cbuf, CachedMappedBufferView &cachedView) {
-        struct SsboDescriptor {
-            u64 address;
-            u32 size;
-        };
-
-        auto ssbo{cbuf.Read<SsboDescriptor>(ctx.executor, desc.cbuf_offset)};
-        cachedView.Update(ctx, ssbo.address, ssbo.size);
-
-        auto view{cachedView.view};
-        ctx.executor.AttachBuffer(view);
-
-        if (desc.is_written) {
-            view.GetBuffer()->MarkGpuDirty();
-        } else {
-            if (auto megaBufferBinding{view.TryMegaBuffer(ctx.executor.cycle, ctx.gpu.megaBufferAllocator, ctx.executor.executionNumber)})
-                return megaBufferBinding;
-        }
-
-        view.GetBuffer()->BlockSequencedCpuBackingWrites();
-
-        return view;
-    }
-
-    static BindlessHandle ReadBindlessHandle(InterconnectContext &ctx, std::array<ConstantBuffer, engine::ShaderStageConstantBufferCount> &constantBuffers, const auto &desc, size_t arrayIdx) {
-        ConstantBuffer &primaryCbuf{constantBuffers[desc.cbuf_index]};
-        size_t elemOffset{arrayIdx << desc.size_shift};
-        size_t primaryCbufOffset{desc.cbuf_offset + elemOffset};
-        u32 primaryVal{primaryCbuf.Read<u32>(ctx.executor, primaryCbufOffset)};
-
-        if constexpr (requires { desc.has_secondary; }) {
-            if (desc.has_secondary) {
-                ConstantBuffer &secondaryCbuf{constantBuffers[desc.secondary_cbuf_index]};
-                size_t secondaryCbufOffset{desc.secondary_cbuf_offset + elemOffset};
-                u32 secondaryVal{secondaryCbuf.Read<u32>(ctx.executor, secondaryCbufOffset)};
-                return {primaryVal | secondaryVal};
-            }
-        }
-
-        return {.raw = primaryVal};
-    }
-
-    static std::pair<vk::DescriptorImageInfo, TextureView *> GetTextureBinding(InterconnectContext &ctx, const Shader::TextureDescriptor &desc, Samplers &samplers, Textures &textures, BindlessHandle handle) {
-        auto sampler{samplers.GetSampler(ctx, handle.samplerIndex, handle.textureIndex)};
-        auto texture{textures.GetTexture(ctx, handle.textureIndex, desc.type)};
-        ctx.executor.AttachTexture(texture);
-        auto view{texture->GetView()};
-
-        return {
-            vk::DescriptorImageInfo{
-                .sampler = **sampler,
-                .imageView = view,
-                .imageLayout = texture->texture->layout
-            },
-            texture
-        };
-    }
-
     DescriptorUpdateInfo *Pipeline::SyncDescriptors(InterconnectContext &ctx, ConstantBufferSet &constantBuffers, Samplers &samplers, Textures &textures, span<TextureView *> sampledImages) {
-        SyncCachedStorageBufferViews(ctx.executor.executionNumber);
+        SyncCachedStorageBufferViews(ctx.executor.executionTag);
 
         u32 writeIdx{};
         auto writes{ctx.executor.allocator->AllocateUntracked<vk::WriteDescriptorSet>(descriptorInfo.totalWriteDescCount)};
@@ -800,6 +762,9 @@ namespace skyline::gpu::interconnect::maxwell3d {
                                  return GetStorageBufferBinding(ctx, desc, constantBuffers[i][desc.cbuf_index], storageBufferViews[storageBufferIdx++]);
                              });
 
+            bindingIdx += stageDescInfo.uniformTexelBufferDescCount;
+            bindingIdx += stageDescInfo.storageTexelBufferDescCount;
+
             writeImageDescs(vk::DescriptorType::eCombinedImageSampler, stage.info.texture_descriptors, stageDescInfo.combinedImageSamplerDescCount,
                             [&](const Shader::TextureDescriptor &desc, size_t arrayIdx) {
                                 BindlessHandle handle{ReadBindlessHandle(ctx, constantBuffers[i], desc, arrayIdx)};
@@ -807,6 +772,8 @@ namespace skyline::gpu::interconnect::maxwell3d {
                                 sampledImages[combinedImageSamplerIdx++] = binding.second;
                                 return binding.first;
                             }, ctx.gpu.traits.quirks.needsIndividualTextureBindingWrites);
+
+            bindingIdx += stageDescInfo.storageImageDescCount;
         }
 
         // Since we don't implement all descriptor types the number of writes might not match what's expected
@@ -825,7 +792,7 @@ namespace skyline::gpu::interconnect::maxwell3d {
     }
 
     DescriptorUpdateInfo *Pipeline::SyncDescriptorsQuickBind(InterconnectContext &ctx, ConstantBufferSet &constantBuffers, Samplers &samplers, Textures &textures, ConstantBuffers::QuickBind quickBind, span<TextureView *> sampledImages) {
-        SyncCachedStorageBufferViews(ctx.executor.executionNumber);
+        SyncCachedStorageBufferViews(ctx.executor.executionTag);
 
         size_t stageIndex{static_cast<size_t>(quickBind.stage)};
         const auto &stageDescInfo{descriptorInfo.stages[stageIndex]};
@@ -909,6 +876,38 @@ namespace skyline::gpu::interconnect::maxwell3d {
             .bindPoint = vk::PipelineBindPoint::eGraphics,
             .descriptorSetIndex = 0,
         });
+    }
+
+    PipelineManager::PipelineManager(GPU &gpu) {
+        std::ifstream stream{gpu.graphicsPipelineCacheManager->OpenReadStream()};
+        i64 lastKnownGoodOffset{stream.tellg()};
+        try {
+            auto startTime{util::GetTimeNs()};
+            PipelineStateBundle bundle;
+
+            while (bundle.Deserialise(stream)) {
+                lastKnownGoodOffset = stream.tellg();
+                auto accessor{FilePipelineStateAccessor{bundle}};
+                map.emplace(bundle.GetKey<PackedPipelineState>(), std::make_unique<Pipeline>(gpu, accessor, bundle.GetKey<PackedPipelineState>()));
+            }
+
+            Logger::Info("Loaded {} graphics pipelines in {}ms", map.size(), (util::GetTimeNs() - startTime) / constant::NsInMillisecond);
+        } catch (const exception &e) {
+            Logger::Warn("Pipeline cache corrupted at: 0x{:X}, error: {}", lastKnownGoodOffset, e.what());
+            gpu.graphicsPipelineCacheManager->InvalidateAllAfter(static_cast<u64>(lastKnownGoodOffset));
+            return;
+        }
+    }
+
+    Pipeline *PipelineManager::FindOrCreate(InterconnectContext &ctx, Textures &textures, ConstantBufferSet &constantBuffers, const PackedPipelineState &packedState, const std::array<ShaderBinary, engine::PipelineCount> &shaderBinaries) {
+        auto it{map.find(packedState)};
+        if (it != map.end())
+            return it->second.get();
+
+        auto bundle{std::make_unique<PipelineStateBundle>()};
+        bundle->Reset(packedState);
+        auto accessor{RuntimeGraphicsPipelineStateAccessor{std::move(bundle), ctx, textures, constantBuffers, shaderBinaries}};
+        return map.emplace(packedState, std::make_unique<Pipeline>(ctx.gpu, accessor, packedState)).first->second.get();
     }
 }
 

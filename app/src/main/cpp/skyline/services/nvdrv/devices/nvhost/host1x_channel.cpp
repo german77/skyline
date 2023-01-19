@@ -39,6 +39,11 @@ namespace skyline::service::nvdrv::device::nvhost {
             const auto &incr{syncpointIncrs[i]};
 
             u32 max{core.syncpointManager.IncrementSyncpointMaxExt(incr.syncpointId, incr.numIncrs)};
+
+            // Increment syncpoints on the CPU to avoid needing to pass through the emulated nvdec code which currently does nothing
+            for (size_t j{}; j < incr.numIncrs; j++)
+                state.soc->host1x.syncpoints[incr.syncpointId].Increment();
+
             if (i < fenceThresholds.size())
                 fenceThresholds[i] = max;
         }
@@ -52,7 +57,8 @@ namespace skyline::service::nvdrv::device::nvhost {
             Logger::Debug("Submit gather, CPU address: 0x{:X}, words: 0x{:X}", gatherAddress, cmdBuf.words);
 
             span gather(reinterpret_cast<u32 *>(gatherAddress), cmdBuf.words);
-            state.soc->host1x.channels[static_cast<size_t>(channelType)].Push(gather);
+            // Skip submitting the cmdbufs as no functionality is implemented
+            // state.soc->host1x.channels[static_cast<size_t>(channelType)].Push(gather);
         }
 
         return PosixResult::Success;
